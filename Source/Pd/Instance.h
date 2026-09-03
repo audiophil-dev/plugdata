@@ -326,10 +326,18 @@ public:
     SmallArray<pd::Patch::Ptr, 16> patches;
 
 private:
+    void handleDebugMessage(Message const& message);
+    void sendDebugReply(var const& response, int requestId);
+    void clearDebugGeneration();
+
     UnorderedMap<void*, SmallArray<pd_weak_reference*>> pdWeakReferences;
 
     moodycamel::ConcurrentQueue<std::function<void()>> functionQueue = moodycamel::ConcurrentQueue<std::function<void()>>(4096);
     moodycamel::ConcurrentQueue<Message> guiMessageQueue = moodycamel::ConcurrentQueue<Message>(64);
+
+    void* debugReceiver = nullptr;
+    String debugGeneration;
+    std::unique_ptr<WeakReference> debugRoot;
 
     std::unique_ptr<FileChooser> openChooser;
     static inline auto luaClasses = UnorderedSet<hash32>(); // Keep track of class names that correspond to pdlua objects

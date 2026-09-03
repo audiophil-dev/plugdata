@@ -33,6 +33,55 @@ EXTERN int sys_load_lib(t_canvas* canvas, char const* classname);
 
 namespace pd {
 
+namespace {
+constexpr int debugProtocolVersion = 1;
+constexpr int maxDebugRequestId = 16777215;
+constexpr int maxEncodedDebugRequestBytes = 64 * 1024;
+constexpr int maxDecodedDebugRequestBytes = 48 * 1024;
+constexpr int maxEncodedDebugResponseBytes = 60 * 1024;
+constexpr int maxGenerationBytes = 128;
+constexpr int maxRootReceiverBytes = 128;
+
+var makeDebugError(int const requestId, String const& code, String const& message)
+{
+    auto* error = new DynamicObject();
+    error->setProperty("code", code);
+    error->setProperty("message", message);
+
+    auto* response = new DynamicObject();
+    response->setProperty("version", debugProtocolVersion);
+    response->setProperty("request_id", requestId);
+    response->setProperty("ok", false);
+    response->setProperty("error", var(error));
+    return var(response);
+}
+
+var makeDebugSuccess(int const requestId)
+{
+    auto* response = new DynamicObject();
+    response->setProperty("version", debugProtocolVersion);
+    response->setProperty("request_id", requestId);
+    response->setProperty("ok", true);
+    response->setProperty("data", var(new DynamicObject()));
+    return var(response);
+}
+
+bool hasOnlySetGenerationFields(DynamicObject const& request)
+{
+    auto const& properties = request.getProperties();
+    if (properties.size() != 5)
+        return false;
+
+    for (auto const& [name, value] : properties) {
+        ignoreUnused(value);
+        auto const propertyName = name.toString();
+        if (propertyName != "version" && propertyName != "request_id" && propertyName != "operation" && propertyName != "generation" && propertyName != "root_receiver")
+            return false;
+    }
+    return true;
+}
+}
+
 class ConsoleMessageHandler final : public Timer {
     Instance* instance;
 
@@ -281,6 +330,7 @@ Instance::~Instance()
     pd_free(static_cast<t_pd*>(parameterReceiver));
     pd_free(static_cast<t_pd*>(pluginLatencyReceiver));
     pd_free(static_cast<t_pd*>(dataBufferReceiver));
+    pd_free(static_cast<t_pd*>(debugReceiver));
 
     libpd_free_instance(static_cast<t_pdinstance*>(instance));
 }
@@ -333,6 +383,9 @@ void Instance::initialisePd(String& pdlua_version)
         reinterpret_cast<t_plugdata_listhook>(internal::instance_multi_list), reinterpret_cast<t_plugdata_messagehook>(internal::instance_multi_message));
 
     dataBufferReceiver = pd::Setup::createReceiver(this, "__to_daw_databuffer", reinterpret_cast<t_plugdata_banghook>(internal::instance_multi_bang), reinterpret_cast<t_plugdata_floathook>(internal::instance_multi_float), reinterpret_cast<t_plugdata_symbolhook>(internal::instance_multi_symbol),
+        reinterpret_cast<t_plugdata_listhook>(internal::instance_multi_list), reinterpret_cast<t_plugdata_messagehook>(internal::instance_multi_message));
+
+    debugReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug", reinterpret_cast<t_plugdata_banghook>(internal::instance_multi_bang), reinterpret_cast<t_plugdata_floathook>(internal::instance_multi_float), reinterpret_cast<t_plugdata_symbolhook>(internal::instance_multi_symbol),
         reinterpret_cast<t_plugdata_listhook>(internal::instance_multi_list), reinterpret_cast<t_plugdata_messagehook>(internal::instance_multi_message));
 
     // Register callback for special Pd messages
@@ -1043,10 +1096,147 @@ void Instance::handleAsyncUpdate()
         case hash("__to_daw_databuffer"):
             fillDataBuffer(mess.list);
             break;
+        case hash("__pd_mcp_debug"):
+            handleDebugMessage(mess);
+            break;
         default:
             break;
         }
     }
+}
+
+void Instance::handleDebugMessage(Message const& message)
+{
+    if (message.selector != "request" || message.list.size() != 1 || !message.list[0].isSymbol()) {
+        sendDebugReply(makeDebugError(0, "InvalidEnvelope", "Expected request plus one symbol atom"), 0);
+        return;
+    }
+
+    auto const* encodedBytes = message.list[0].getSymbol()->s_name;
+    auto const encodedSize = static_cast<int>(strlen(encodedBytes));
+    if (encodedSize > maxEncodedDebugRequestBytes) {
+        sendDebugReply(makeDebugError(0, "PayloadTooLarge", "Encoded request exceeds 64 KiB"), 0);
+        return;
+    }
+
+    String const encoded = String::fromUTF8(encodedBytes);
+    MemoryOutputStream decoded;
+    if (!Base64::convertFromBase64(decoded, encoded)
+        || Base64::toBase64(decoded.getData(), decoded.getDataSize()) != encoded) {
+        sendDebugReply(makeDebugError(0, "InvalidEnvelope", "Request payload is not canonical base64"), 0);
+        return;
+    }
+
+    auto const decodedSize = static_cast<int>(decoded.getDataSize());
+    if (decodedSize > maxDecodedDebugRequestBytes) {
+        sendDebugReply(makeDebugError(0, "PayloadTooLarge", "Decoded request exceeds 48 KiB"), 0);
+        return;
+    }
+
+    auto const* decodedBytes = static_cast<char const*>(decoded.getData());
+    if (memchr(decodedBytes, 0, static_cast<size_t>(decodedSize)) != nullptr
+        || !CharPointer_UTF8::isValidString(decodedBytes, decodedSize)) {
+        sendDebugReply(makeDebugError(0, "InvalidEnvelope", "Decoded request is not valid UTF-8 JSON"), 0);
+        return;
+    }
+
+    var envelope;
+    auto const parseResult = JSON::parse(String::fromUTF8(decodedBytes, decodedSize), envelope);
+    auto* request = envelope.getDynamicObject();
+    if (parseResult.failed() || !request) {
+        sendDebugReply(makeDebugError(0, "InvalidEnvelope", "Decoded request must be a JSON object"), 0);
+        return;
+    }
+
+    auto const requestIdValue = request->getProperty("request_id");
+    if ((!requestIdValue.isInt() && !requestIdValue.isInt64())
+        || static_cast<int64>(requestIdValue) < 1
+        || static_cast<int64>(requestIdValue) > maxDebugRequestId) {
+        sendDebugReply(makeDebugError(0, "InvalidRequest", "request_id must be an integer from 1 through 16777215"), 0);
+        return;
+    }
+    auto const requestId = static_cast<int>(requestIdValue);
+
+    auto const version = request->getProperty("version");
+    if ((!version.isInt() && !version.isInt64()) || static_cast<int64>(version) != debugProtocolVersion) {
+        sendDebugReply(makeDebugError(requestId, "UnsupportedProtocolVersion", "Only protocol version 1 is supported"), requestId);
+        return;
+    }
+
+    auto const operation = request->getProperty("operation");
+    if (!operation.isString() || operation.toString() != "set_generation") {
+        sendDebugReply(makeDebugError(requestId, "UnknownOperation", "Unknown debug operation"), requestId);
+        return;
+    }
+
+    if (!hasOnlySetGenerationFields(*request)) {
+        clearDebugGeneration();
+        sendDebugReply(makeDebugError(requestId, "InvalidRequest", "set_generation contains unknown or missing fields"), requestId);
+        return;
+    }
+
+    auto const generationValue = request->getProperty("generation");
+    auto const rootReceiverValue = request->getProperty("root_receiver");
+    if (!generationValue.isString() || !rootReceiverValue.isString()) {
+        clearDebugGeneration();
+        sendDebugReply(makeDebugError(requestId, "InvalidRequest", "generation and root_receiver must be strings"), requestId);
+        return;
+    }
+
+    String const generation = generationValue.toString();
+    String const rootReceiver = rootReceiverValue.toString();
+    if (generation.isEmpty() || generation.getNumBytesAsUTF8() > maxGenerationBytes
+        || rootReceiver.isEmpty() || rootReceiver.getNumBytesAsUTF8() > maxRootReceiverBytes) {
+        clearDebugGeneration();
+        sendDebugReply(makeDebugError(requestId, "InvalidRequest", "generation and root_receiver must contain 1 through 128 UTF-8 bytes"), requestId);
+        return;
+    }
+
+    String runtimeError;
+    lockAudioThread();
+    debugGeneration.clear();
+    debugRoot.reset();
+
+    auto* rootObject = generateSymbol(rootReceiver)->s_thing;
+    if (!rootObject) {
+        runtimeError = "CanvasNotFound";
+    } else if (pd_class(rootObject) != canvas_class) {
+        runtimeError = "CanvasTypeMismatch";
+    } else {
+        auto root = std::make_unique<WeakReference>(rootObject, this);
+        if (!root->isValid() || pd_class(&root->getRawUnchecked<t_canvas>()->gl_obj.ob_pd) != canvas_class) {
+            runtimeError = "CanvasNotFound";
+        } else {
+            debugGeneration = generation;
+            debugRoot = std::move(root);
+        }
+    }
+    unlockAudioThread();
+
+    if (runtimeError.isNotEmpty()) {
+        String const message = runtimeError == "CanvasNotFound" ? "The root receiver is not bound" : "The root receiver is not a canvas";
+        sendDebugReply(makeDebugError(requestId, runtimeError, message), requestId);
+        return;
+    }
+
+    sendDebugReply(makeDebugSuccess(requestId), requestId);
+}
+
+void Instance::sendDebugReply(var const& response, int const requestId)
+{
+    String encoded = Base64::toBase64(JSON::toString(response, true));
+    if (encoded.getNumBytesAsUTF8() > maxEncodedDebugResponseBytes)
+        encoded = Base64::toBase64(JSON::toString(makeDebugError(requestId, "ResponseTooLarge", "Encoded response exceeds 60 KiB"), true));
+
+    sendMessage("__pd_mcp_debug_reply", "response", { generateSymbol(encoded) });
+}
+
+void Instance::clearDebugGeneration()
+{
+    lockAudioThread();
+    debugGeneration.clear();
+    debugRoot.reset();
+    unlockAudioThread();
 }
 
 void Instance::KeyHandler::convertJUCEKeyToPd(int& keynum, t_symbol*& keysym)

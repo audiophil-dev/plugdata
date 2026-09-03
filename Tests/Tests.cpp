@@ -20,6 +20,7 @@
 #include "ExportProgressTest.h"
 #include "SmallUITest.h"
 #include "OnboardingTest.h"
+#include "DirectDebugApiTest.h"
 #include "CommandInputTest.h"
 #include "EditWorkflowTest.h"
 #include "LuaObjectTest.h"
@@ -48,6 +49,7 @@ void runTests(PluginEditor* editor)
         ExportProgressTest exportProgressTest(editor);
         SmallUITest smallUITest(editor);
         OnboardingTest onboardingTest(editor);
+        DirectDebugApiTest directDebugApiTest(editor);
         CommandInputTest commandInputTest(editor);
         EditWorkflowTest editWorkflowTest(editor);
         LuaObjectTest luaObjectTest(editor);
@@ -73,6 +75,7 @@ void runTests(PluginEditor* editor)
                           &exportProgressTest,
                           &smallUITest,
                           &onboardingTest,
+                          &directDebugApiTest,
                           &commandInputTest,
                           &editWorkflowTest,
                           &luaObjectTest,
