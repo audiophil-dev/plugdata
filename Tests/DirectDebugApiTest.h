@@ -12,6 +12,8 @@ private:
         int requestId;
         bool ok;
         String errorCode;
+        String generationProbe;
+        bool generationActive = false;
     };
 
     static constexpr int maxEncodedRequestBytes = 64 * 1024;
@@ -50,12 +52,17 @@ private:
     void sendWire(String const& selector, SmallArray<pd::Atom> const& atoms, int const requestId, bool const ok, String const& errorCode)
     {
         expectedReplies.push_back({ requestId, ok, errorCode });
+        editor->pd->lockAudioThread();
         editor->pd->sendMessage("__pd_mcp_debug", selector.toRawUTF8(), atoms);
+        editor->pd->unlockAudioThread();
     }
 
     void sendEncoded(String const& encoded, int const requestId, bool const ok, String const& errorCode)
     {
-        sendWire("request", { editor->pd->generateSymbol(encoded) }, requestId, ok, errorCode);
+        expectedReplies.push_back({ requestId, ok, errorCode });
+        editor->pd->lockAudioThread();
+        editor->pd->sendMessage("__pd_mcp_debug", "request", { editor->pd->generateSymbol(encoded) });
+        editor->pd->unlockAudioThread();
     }
 
     void sendJson(String const& json, int const requestId, bool const ok, String const& errorCode)
@@ -76,6 +83,7 @@ private:
             return pd::Setup::createReceiver(this, "__pd_mcp_debug_lifecycle_test", nullptr, nullptr, nullptr, nullptr, receiveLifecycleMessage);
         };
 
+        editor->pd->lockAudioThread();
         auto* receiver = createReceiver();
         editor->pd->sendMessage("__pd_mcp_debug_lifecycle_test", "probe", {});
         check(receivedLifecycleMessages == 1, "a bound receiver must receive one message");
@@ -88,14 +96,17 @@ private:
         editor->pd->sendMessage("__pd_mcp_debug_lifecycle_test", "probe", {});
         check(receivedLifecycleMessages == 2, "a recreated receiver must receive one message");
         pd_free(static_cast<t_pd*>(receiver));
+        editor->pd->unlockAudioThread();
     }
 
     void testProtocol()
     {
         beginTest("Versioned receiver and generation registration");
 
+        editor->pd->lockAudioThread();
         replyReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug_reply", nullptr, nullptr, nullptr, nullptr, receiveReply);
         nonCanvasReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug_non_canvas", nullptr, nullptr, nullptr, nullptr, nullptr);
+        editor->pd->unlockAudioThread();
 
         rootCanvas = editor->getTabComponent().openPatch("#N canvas 100 100 300 200 12;\n");
         check(rootCanvas != nullptr, "the generation fixture canvas must open");
@@ -112,22 +123,36 @@ private:
         editor->pd->unlockAudioThread();
 
         sendRequest(makeSetGenerationRequest(1, "generation-1", rootReceiver), 1, true, {});
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
 
+        editor->pd->lockAudioThread();
         expectedReplies.push_back({ 0, false, "InvalidEnvelope" });
         editor->pd->sendBang("__pd_mcp_debug");
         expectedReplies.push_back({ 0, false, "InvalidEnvelope" });
         editor->pd->sendFloat("__pd_mcp_debug", 1.0f);
         expectedReplies.push_back({ 0, false, "InvalidEnvelope" });
         editor->pd->sendSymbol("__pd_mcp_debug", "not-a-request");
+        editor->pd->unlockAudioThread();
         sendWire("wrong", {}, 0, false, "InvalidEnvelope");
         sendWire("request", {}, 0, false, "InvalidEnvelope");
-        sendWire("request", { editor->pd->generateSymbol("one"), editor->pd->generateSymbol("two") }, 0, false, "InvalidEnvelope");
+        expectedReplies.push_back({ 0, false, "InvalidEnvelope" });
+        editor->pd->lockAudioThread();
+        editor->pd->sendMessage("__pd_mcp_debug", "request", { editor->pd->generateSymbol("one"), editor->pd->generateSymbol("two") });
+        editor->pd->unlockAudioThread();
         sendWire("request", { 1.0f }, 0, false, "InvalidEnvelope");
 
         sendEncoded("%%%", 0, false, "InvalidEnvelope");
         sendEncoded("AA=A", 0, false, "InvalidEnvelope");
         sendJson("{invalid", 0, false, "InvalidEnvelope");
+        sendJson("{\"array\":[}]", 0, false, "InvalidEnvelope");
         sendJson("[]", 0, false, "InvalidEnvelope");
+        sendJson(JSON::toString(makeSetGenerationRequest(21, "generation-trailing", rootReceiver), true) + " trailing", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("[] trailing", 0, false, "InvalidEnvelope");
+        sendJson(JSON::toString(makeSetGenerationRequest(22, "generation-1", rootReceiver), true) + " \n\t", 22, true, {});
+        sendJson("{\"version\":1,\"request_id\":23,\"operation\":\"unknown\",\"padding\":\"}]\"}", 23, false, "UnknownOperation");
 
         String const largePrefix = "{\"version\":1,\"request_id\":20,\"operation\":\"unknown\",\"padding\":\"";
         String const largeSuffix = "\"}";
@@ -154,6 +179,8 @@ private:
         sendJson("{\"version\":1,\"request_id\":11,\"operation\":\"unknown\",\"extra\":true}", 11, false, "UnknownOperation");
 
         sendRequest(makeSetGenerationRequest(12, "g", rootReceiver, true), 12, false, "InvalidRequest");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = false;
         sendJson("{\"version\":1,\"request_id\":13,\"operation\":\"set_generation\",\"root_receiver\":\"r\"}", 13, false, "InvalidRequest");
         sendRequest(makeSetGenerationRequest(14, true, rootReceiver), 14, false, "InvalidRequest");
         sendRequest(makeSetGenerationRequest(15, "", rootReceiver), 15, false, "InvalidRequest");
@@ -163,13 +190,24 @@ private:
 
         sendRequest(makeSetGenerationRequest(19, "g", "__pd_mcp_debug_missing_root"), 19, false, "CanvasNotFound");
         sendRequest(makeSetGenerationRequest(20, "g", "__pd_mcp_debug_non_canvas"), 20, false, "CanvasTypeMismatch");
-        sendRequest(makeSetGenerationRequest(16777215, String::repeatedString(String::charToString(0x00e9), 64), rootReceiver), 16777215, true, {});
+        String const boundaryGeneration = String::repeatedString(String::charToString(0x00e9), 64);
+        sendRequest(makeSetGenerationRequest(16777215, boundaryGeneration, rootReceiver), 16777215, true, {});
+        expectedReplies.back().generationProbe = boundaryGeneration;
+        expectedReplies.back().generationActive = true;
 
         startTimer(5000);
     }
 
     void captureReply(char const* selector, int const argc, t_atom* argv)
     {
+        auto const responseIndex = responses.size();
+        if (responseIndex < static_cast<int>(expectedReplies.size())) {
+            auto const& expected = expectedReplies[static_cast<size_t>(responseIndex)];
+            if (expected.generationProbe.isNotEmpty())
+                check(editor->pd->isDebugGenerationActiveUnderLock(expected.generationProbe) == expected.generationActive,
+                    "generation state must reflect registration success or invalidation before the reply is observed");
+        }
+
         var response;
         bool const validWire = String::fromUTF8(selector) == "response" && argc == 1 && argv[0].a_type == A_SYMBOL;
         check(validWire, "each reply must be selector response plus one symbol atom");
@@ -242,6 +280,7 @@ private:
             }
         }
 
+        editor->pd->lockAudioThread();
         if (replyReceiver)
             pd_free(static_cast<t_pd*>(replyReceiver));
         if (nonCanvasReceiver)
@@ -249,11 +288,10 @@ private:
 
         if (rootCanvas) {
             if (auto* root = rootCanvas->patch.getRawPointer()) {
-                editor->pd->lockAudioThread();
                 pd_unbind(&root->gl_obj.ob_pd, editor->pd->generateSymbol(rootReceiver));
-                editor->pd->unlockAudioThread();
             }
         }
+        editor->pd->unlockAudioThread();
 
         auto& tabbar = editor->getTabComponent();
         while (auto* canvas = tabbar.getCurrentCanvas())

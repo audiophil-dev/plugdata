@@ -17,6 +17,7 @@ extern "C" {
 #include "Utility/ModifierKeyListener.h"
 
 class ObjectImplementationManager;
+class DirectDebugApiTest;
 
 namespace pd {
 class ConsoleMessageHandler;
@@ -326,9 +327,12 @@ public:
     SmallArray<pd::Patch::Ptr, 16> patches;
 
 private:
+    friend class ::DirectDebugApiTest;
+
     void handleDebugMessage(Message const& message);
-    void sendDebugReply(var const& response, int requestId);
+    void sendDebugReplyUnderLock(var const& response, int requestId);
     void clearDebugGeneration();
+    bool isDebugGenerationActiveUnderLock(String const& generation) const;
 
     UnorderedMap<void*, SmallArray<pd_weak_reference*>> pdWeakReferences;
 

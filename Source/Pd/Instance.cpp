@@ -80,6 +80,42 @@ bool hasOnlySetGenerationFields(DynamicObject const& request)
     }
     return true;
 }
+
+bool hasSingleCompleteJsonValue(String const& json)
+{
+    auto cursor = json.getCharPointer().findEndOfWhitespace();
+    if (*cursor != '{' && *cursor != '[')
+        return false;
+
+    std::vector<juce_wchar> delimiters;
+    bool insideString = false;
+    bool escaped = false;
+    while (!cursor.isEmpty()) {
+        auto const character = cursor.getAndAdvance();
+        if (insideString) {
+            if (escaped)
+                escaped = false;
+            else if (character == '\\')
+                escaped = true;
+            else if (character == '"')
+                insideString = false;
+        } else if (character == '"') {
+            insideString = true;
+        } else if (character == '{' || character == '[') {
+            delimiters.push_back(character);
+        } else if (character == '}' || character == ']') {
+            if (delimiters.empty()
+                || (character == '}' && delimiters.back() != '{')
+                || (character == ']' && delimiters.back() != '['))
+                return false;
+
+            delimiters.pop_back();
+            if (delimiters.empty())
+                return cursor.findEndOfWhitespace().isEmpty();
+        }
+    }
+    return false;
+}
 }
 
 class ConsoleMessageHandler final : public Timer {
@@ -1107,15 +1143,21 @@ void Instance::handleAsyncUpdate()
 
 void Instance::handleDebugMessage(Message const& message)
 {
+    auto const reply = [this](var const& response, int const requestId) {
+        lockAudioThread();
+        sendDebugReplyUnderLock(response, requestId);
+        unlockAudioThread();
+    };
+
     if (message.selector != "request" || message.list.size() != 1 || !message.list[0].isSymbol()) {
-        sendDebugReply(makeDebugError(0, "InvalidEnvelope", "Expected request plus one symbol atom"), 0);
+        reply(makeDebugError(0, "InvalidEnvelope", "Expected request plus one symbol atom"), 0);
         return;
     }
 
     auto const* encodedBytes = message.list[0].getSymbol()->s_name;
     auto const encodedSize = static_cast<int>(strlen(encodedBytes));
     if (encodedSize > maxEncodedDebugRequestBytes) {
-        sendDebugReply(makeDebugError(0, "PayloadTooLarge", "Encoded request exceeds 64 KiB"), 0);
+        reply(makeDebugError(0, "PayloadTooLarge", "Encoded request exceeds 64 KiB"), 0);
         return;
     }
 
@@ -1123,28 +1165,34 @@ void Instance::handleDebugMessage(Message const& message)
     MemoryOutputStream decoded;
     if (!Base64::convertFromBase64(decoded, encoded)
         || Base64::toBase64(decoded.getData(), decoded.getDataSize()) != encoded) {
-        sendDebugReply(makeDebugError(0, "InvalidEnvelope", "Request payload is not canonical base64"), 0);
+        reply(makeDebugError(0, "InvalidEnvelope", "Request payload is not canonical base64"), 0);
         return;
     }
 
     auto const decodedSize = static_cast<int>(decoded.getDataSize());
     if (decodedSize > maxDecodedDebugRequestBytes) {
-        sendDebugReply(makeDebugError(0, "PayloadTooLarge", "Decoded request exceeds 48 KiB"), 0);
+        reply(makeDebugError(0, "PayloadTooLarge", "Decoded request exceeds 48 KiB"), 0);
         return;
     }
 
     auto const* decodedBytes = static_cast<char const*>(decoded.getData());
     if (memchr(decodedBytes, 0, static_cast<size_t>(decodedSize)) != nullptr
         || !CharPointer_UTF8::isValidString(decodedBytes, decodedSize)) {
-        sendDebugReply(makeDebugError(0, "InvalidEnvelope", "Decoded request is not valid UTF-8 JSON"), 0);
+        reply(makeDebugError(0, "InvalidEnvelope", "Decoded request is not valid UTF-8 JSON"), 0);
+        return;
+    }
+
+    String const json = String::fromUTF8(decodedBytes, decodedSize);
+    if (!hasSingleCompleteJsonValue(json)) {
+        reply(makeDebugError(0, "InvalidEnvelope", "Decoded request must contain exactly one JSON value"), 0);
         return;
     }
 
     var envelope;
-    auto const parseResult = JSON::parse(String::fromUTF8(decodedBytes, decodedSize), envelope);
+    auto const parseResult = JSON::parse(json, envelope);
     auto* request = envelope.getDynamicObject();
     if (parseResult.failed() || !request) {
-        sendDebugReply(makeDebugError(0, "InvalidEnvelope", "Decoded request must be a JSON object"), 0);
+        reply(makeDebugError(0, "InvalidEnvelope", "Decoded request must be a JSON object"), 0);
         return;
     }
 
@@ -1152,26 +1200,26 @@ void Instance::handleDebugMessage(Message const& message)
     if ((!requestIdValue.isInt() && !requestIdValue.isInt64())
         || static_cast<int64>(requestIdValue) < 1
         || static_cast<int64>(requestIdValue) > maxDebugRequestId) {
-        sendDebugReply(makeDebugError(0, "InvalidRequest", "request_id must be an integer from 1 through 16777215"), 0);
+        reply(makeDebugError(0, "InvalidRequest", "request_id must be an integer from 1 through 16777215"), 0);
         return;
     }
     auto const requestId = static_cast<int>(requestIdValue);
 
     auto const version = request->getProperty("version");
     if ((!version.isInt() && !version.isInt64()) || static_cast<int64>(version) != debugProtocolVersion) {
-        sendDebugReply(makeDebugError(requestId, "UnsupportedProtocolVersion", "Only protocol version 1 is supported"), requestId);
+        reply(makeDebugError(requestId, "UnsupportedProtocolVersion", "Only protocol version 1 is supported"), requestId);
         return;
     }
 
     auto const operation = request->getProperty("operation");
     if (!operation.isString() || operation.toString() != "set_generation") {
-        sendDebugReply(makeDebugError(requestId, "UnknownOperation", "Unknown debug operation"), requestId);
+        reply(makeDebugError(requestId, "UnknownOperation", "Unknown debug operation"), requestId);
         return;
     }
 
     if (!hasOnlySetGenerationFields(*request)) {
         clearDebugGeneration();
-        sendDebugReply(makeDebugError(requestId, "InvalidRequest", "set_generation contains unknown or missing fields"), requestId);
+        reply(makeDebugError(requestId, "InvalidRequest", "set_generation contains unknown or missing fields"), requestId);
         return;
     }
 
@@ -1179,7 +1227,7 @@ void Instance::handleDebugMessage(Message const& message)
     auto const rootReceiverValue = request->getProperty("root_receiver");
     if (!generationValue.isString() || !rootReceiverValue.isString()) {
         clearDebugGeneration();
-        sendDebugReply(makeDebugError(requestId, "InvalidRequest", "generation and root_receiver must be strings"), requestId);
+        reply(makeDebugError(requestId, "InvalidRequest", "generation and root_receiver must be strings"), requestId);
         return;
     }
 
@@ -1188,7 +1236,7 @@ void Instance::handleDebugMessage(Message const& message)
     if (generation.isEmpty() || generation.getNumBytesAsUTF8() > maxGenerationBytes
         || rootReceiver.isEmpty() || rootReceiver.getNumBytesAsUTF8() > maxRootReceiverBytes) {
         clearDebugGeneration();
-        sendDebugReply(makeDebugError(requestId, "InvalidRequest", "generation and root_receiver must contain 1 through 128 UTF-8 bytes"), requestId);
+        reply(makeDebugError(requestId, "InvalidRequest", "generation and root_receiver must contain 1 through 128 UTF-8 bytes"), requestId);
         return;
     }
 
@@ -1215,14 +1263,14 @@ void Instance::handleDebugMessage(Message const& message)
 
     if (runtimeError.isNotEmpty()) {
         String const message = runtimeError == "CanvasNotFound" ? "The root receiver is not bound" : "The root receiver is not a canvas";
-        sendDebugReply(makeDebugError(requestId, runtimeError, message), requestId);
+        reply(makeDebugError(requestId, runtimeError, message), requestId);
         return;
     }
 
-    sendDebugReply(makeDebugSuccess(requestId), requestId);
+    reply(makeDebugSuccess(requestId), requestId);
 }
 
-void Instance::sendDebugReply(var const& response, int const requestId)
+void Instance::sendDebugReplyUnderLock(var const& response, int const requestId)
 {
     String encoded = Base64::toBase64(JSON::toString(response, true));
     if (encoded.getNumBytesAsUTF8() > maxEncodedDebugResponseBytes)
@@ -1237,6 +1285,14 @@ void Instance::clearDebugGeneration()
     debugGeneration.clear();
     debugRoot.reset();
     unlockAudioThread();
+}
+
+bool Instance::isDebugGenerationActiveUnderLock(String const& generation) const
+{
+    if (debugGeneration != generation || !debugRoot || !debugRoot->isValid())
+        return false;
+
+    return pd_class(&debugRoot->getRawUnchecked<t_canvas>()->gl_obj.ob_pd) == canvas_class;
 }
 
 void Instance::KeyHandler::convertJUCEKeyToPd(int& keynum, t_symbol*& keysym)
