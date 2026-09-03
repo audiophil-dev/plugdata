@@ -13,6 +13,7 @@ private:
         bool ok;
         String errorCode;
         String generationProbe;
+        String successStatus;
         bool generationActive = false;
     };
 
@@ -46,6 +47,26 @@ private:
         request->setProperty("root_receiver", rootReceiver);
         if (addExtraField)
             request->setProperty("extra", true);
+        return var(request);
+    }
+
+    static var makeSendObjectRequest(int const requestId, String const& generation, Array<int> const& path, int const objectOrdinal,
+        String const& selector, Array<var> const& atoms)
+    {
+        auto* request = new DynamicObject();
+        request->setProperty("version", 1);
+        request->setProperty("request_id", requestId);
+        request->setProperty("operation", "send_object");
+        request->setProperty("generation", generation);
+
+        var canvasPath = Array<var>();
+        for (auto const ordinal : path)
+            canvasPath.getArray()->add(ordinal);
+        request->setProperty("canvas_path", canvasPath);
+        request->setProperty("object_ordinal", objectOrdinal);
+        request->setProperty("selector", selector);
+        var atomList = atoms;
+        request->setProperty("atoms", atomList);
         return var(request);
     }
 
@@ -108,7 +129,7 @@ private:
         nonCanvasReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug_non_canvas", nullptr, nullptr, nullptr, nullptr, nullptr);
         editor->pd->unlockAudioThread();
 
-        rootCanvas = editor->getTabComponent().openPatch("#N canvas 100 100 300 200 12;\n");
+        rootCanvas = editor->getTabComponent().openPatch("#N canvas 100 100 300 200 12;\n#X obj 20 20 print direct-root;\n#X text 20 50 comment;\n#N canvas 0 0 300 200 nested 0;\n#X obj 20 20 print direct-nested;\n#X restore 100 100 pd nested;\n");
         check(rootCanvas != nullptr, "the generation fixture canvas must open");
         if (!rootCanvas) {
             finishProtocol();
@@ -116,6 +137,7 @@ private:
         }
 
         rootCanvas->performSynchronise();
+        originalCanvasContent = rootCanvas->patch.getCanvasContent();
         rootReceiver = String::repeatedString("r", 128);
         auto* root = rootCanvas->patch.getRawPointer();
         editor->pd->lockAudioThread();
@@ -125,6 +147,32 @@ private:
         sendRequest(makeSetGenerationRequest(1, "generation-1", rootReceiver), 1, true, {});
         expectedReplies.back().generationProbe = "generation-1";
         expectedReplies.back().generationActive = true;
+
+        auto const generation = String("generation-1");
+        Array<var> noAtoms;
+        Array<var> oneFloat { 12.5 };
+        Array<var> oneSymbol { "value" };
+        Array<var> listAtoms { 12.5, "value" };
+        auto sendObject = [this, &generation](int const requestId, Array<int> const& path, int const ordinal, String const& selector, Array<var> const& atoms) {
+            sendRequest(makeSendObjectRequest(requestId, generation, path, ordinal, selector, atoms), requestId, true, {});
+            expectedReplies.back().successStatus = "invoked";
+        };
+        sendObject(40, {}, 0, "bang", noAtoms);
+        sendObject(41, {}, 0, "float", oneFloat);
+        sendObject(42, {}, 0, "symbol", oneSymbol);
+        sendObject(43, {}, 0, "list", listAtoms);
+        sendObject(44, {}, 0, "custom", listAtoms);
+        sendObject(45, { 2 }, 0, "bang", noAtoms);
+        sendObject(46, { 2 }, 0, "float", oneFloat);
+        sendObject(47, { 2 }, 0, "symbol", oneSymbol);
+        sendObject(48, { 2 }, 0, "list", listAtoms);
+        sendObject(49, { 2 }, 0, "custom", listAtoms);
+        sendRequest(makeSendObjectRequest(50, "stale-generation", {}, 0, "bang", noAtoms), 50, false, "StaleGeneration");
+        sendRequest(makeSendObjectRequest(51, generation, { 0 }, 0, "bang", noAtoms), 51, false, "CanvasTypeMismatch");
+        sendRequest(makeSendObjectRequest(52, generation, { 99 }, 0, "bang", noAtoms), 52, false, "CanvasNotFound");
+        sendRequest(makeSendObjectRequest(53, generation, {}, 99, "bang", noAtoms), 53, false, "ObjectNotFound");
+        sendRequest(makeSendObjectRequest(54, generation, {}, 0, "bang", oneFloat), 54, false, "InvalidAtoms");
+        sendRequest(makeSendObjectRequest(55, generation, {}, 0, "float", noAtoms), 55, false, "InvalidAtoms");
 
         editor->pd->lockAudioThread();
         expectedReplies.push_back({ 0, false, "InvalidEnvelope" });
@@ -311,6 +359,8 @@ private:
         stopTimer();
 
         check(responses.size() == static_cast<int>(expectedReplies.size()), "every request must produce exactly one response");
+        check(rootCanvas && rootCanvas->patch.getCanvasContent() == originalCanvasContent,
+            "object dispatch must not change serialized patch content");
         int const responseCount = jmin(responses.size(), static_cast<int>(expectedReplies.size()));
         for (int i = 0; i < responseCount; ++i) {
             auto* response = responses[i].getDynamicObject();
@@ -324,18 +374,23 @@ private:
             auto const ok = response->getProperty("ok");
             check((version.isInt() || version.isInt64()) && static_cast<int>(version) == 1, "response version must be 1");
             check((requestId.isInt() || requestId.isInt64()) && static_cast<int>(requestId) == expected.requestId, "response IDs must preserve valid request correlation");
-            check(ok.isBool() && static_cast<bool>(ok) == expected.ok, "response ok must match the outcome");
+            check(ok.isBool() && static_cast<bool>(ok) == expected.ok, "response ok must match the outcome for request " + String(expected.requestId));
             check(response->getProperties().size() == 4, "responses must contain exactly four top-level fields");
 
             if (expected.ok) {
                 check(response->hasProperty("data") && response->getProperty("data").isObject(), "successful responses must contain object data");
+                if (expected.successStatus.isNotEmpty()) {
+                    auto* data = response->getProperty("data").getDynamicObject();
+                    check(data && data->getProperty("status").toString() == expected.successStatus,
+                        "object dispatch must acknowledge invocation without semantic success claims");
+                }
             } else {
                 auto* error = response->getProperty("error").getDynamicObject();
                 check(error != nullptr, "failed responses must contain an error object");
                 if (error) {
                     check(error->getProperties().size() == 2, "errors must contain exactly code and message");
                     check(error->getProperty("code").isString() && error->getProperty("code").toString() == expected.errorCode,
-                        "failed responses must use the expected stable code");
+                        "failed responses must use the expected stable code for request " + String(expected.requestId));
                     check(error->getProperty("message").isString() && error->getProperty("message").toString().isNotEmpty(),
                         "failed responses must include a non-empty message");
                 }
@@ -374,6 +429,7 @@ private:
     void* replyReceiver = nullptr;
     void* nonCanvasReceiver = nullptr;
     String rootReceiver;
+    String originalCanvasContent;
     int receivedLifecycleMessages = 0;
     bool allPassed = true;
     bool finished = false;

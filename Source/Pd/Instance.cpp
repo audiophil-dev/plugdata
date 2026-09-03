@@ -12,6 +12,7 @@
 #include "Dialogs/Dialogs.h"
 
 #include <algorithm>
+#include <cmath>
 #include <string_view>
 #include "Instance.h"
 #include "Patch.h"
@@ -67,6 +68,19 @@ var makeDebugSuccess(int const requestId)
     return var(response);
 }
 
+var makeDebugInvocationSuccess(int const requestId)
+{
+    auto* data = new DynamicObject();
+    data->setProperty("status", "invoked");
+
+    auto* response = new DynamicObject();
+    response->setProperty("version", debugProtocolVersion);
+    response->setProperty("request_id", requestId);
+    response->setProperty("ok", true);
+    response->setProperty("data", var(data));
+    return var(response);
+}
+
 bool hasOnlySetGenerationFields(DynamicObject const& request)
 {
     auto const& properties = request.getProperties();
@@ -80,6 +94,28 @@ bool hasOnlySetGenerationFields(DynamicObject const& request)
             return false;
     }
     return true;
+}
+
+bool hasOnlySendObjectFields(DynamicObject const& request)
+{
+    auto const& properties = request.getProperties();
+    if (properties.size() != 8)
+        return false;
+
+    for (auto const& [name, value] : properties) {
+        ignoreUnused(value);
+        auto const propertyName = name.toString();
+        if (propertyName != "version" && propertyName != "request_id" && propertyName != "operation"
+            && propertyName != "generation" && propertyName != "canvas_path" && propertyName != "object_ordinal"
+            && propertyName != "selector" && propertyName != "atoms")
+            return false;
+    }
+    return true;
+}
+
+bool isFiniteDebugNumber(var const& value)
+{
+    return value.isDouble() || value.isInt() || value.isInt64() ? std::isfinite(static_cast<double>(value)) : false;
 }
 
 class StrictJsonValidator {
@@ -1249,27 +1285,44 @@ void Instance::sendMessage(char const* receiver, char const* msg, SmallArray<Ato
 void Instance::processSend(dmessage const& mess)
 {
     if (auto obj = mess.object.get<t_pd>()) {
-        if (mess.selector == "list") {
-            auto argv = SmallArray<t_atom>(mess.list.size());
-            for (size_t i = 0; i < mess.list.size(); ++i) {
-                if (mess.list[i].isFloat())
-                    SETFLOAT(argv.data() + i, mess.list[i].getFloat());
-                else if (mess.list[i].isSymbol()) {
-                    SETSYMBOL(argv.data() + i, mess.list[i].getSymbol());
-                } else
-                    SETFLOAT(argv.data() + i, 0.0);
-            }
-            pd_list(obj.get(), generateSymbol("list"), static_cast<int>(mess.list.size()), argv.data());
-        } else if (mess.selector == "float" && !mess.list.empty() && mess.list[0].isFloat()) {
-            pd_float(obj.get(), mess.list[0].getFloat());
-        } else if (mess.selector == "symbol" && !mess.list.empty() && mess.list[0].isSymbol()) {
-            pd_symbol(obj.get(), mess.list[0].getSymbol());
-        } else {
-            sendTypedMessage(obj.get(), mess.selector.data(), mess.list);
-        }
+        dispatchResolvedMessage(obj.get(), mess.selector, mess.list);
     } else {
         sendMessage(mess.destination.data(), mess.selector.data(), mess.list);
     }
+}
+
+void Instance::dispatchResolvedMessage(t_pd* const object, SmallString const& selector, SmallArray<Atom> const& atoms)
+{
+    if (selector == "bang" && atoms.empty()) {
+        pd_bang(object);
+        return;
+    }
+
+    if (selector == "list") {
+        auto argv = SmallArray<t_atom>(atoms.size());
+        for (size_t i = 0; i < atoms.size(); ++i) {
+            if (atoms[i].isFloat())
+                SETFLOAT(argv.data() + i, atoms[i].getFloat());
+            else if (atoms[i].isSymbol())
+                SETSYMBOL(argv.data() + i, atoms[i].getSymbol());
+            else
+                SETFLOAT(argv.data() + i, 0.0);
+        }
+        pd_list(object, generateSymbol("list"), static_cast<int>(atoms.size()), argv.data());
+        return;
+    }
+
+    if (selector == "float" && atoms.size() == 1 && atoms[0].isFloat()) {
+        pd_float(object, atoms[0].getFloat());
+        return;
+    }
+
+    if (selector == "symbol" && atoms.size() == 1 && atoms[0].isSymbol()) {
+        pd_symbol(object, atoms[0].getSymbol());
+        return;
+    }
+
+    sendTypedMessage(object, selector.data(), atoms);
 }
 
 void Instance::registerMessageListener(void* object, MessageListener* messageListener)
@@ -1466,8 +1519,121 @@ void Instance::handleDebugMessage(Message const& message)
     }
 
     auto const operation = request->getProperty("operation");
-    if (!operation.isString() || operation.toString() != "set_generation") {
+    if (!operation.isString() || (operation.toString() != "set_generation" && operation.toString() != "send_object")) {
         reply(makeDebugError(requestId, "UnknownOperation", "Unknown debug operation"), requestId);
+        return;
+    }
+
+    if (operation.toString() == "send_object") {
+        if (!hasOnlySendObjectFields(*request)) {
+            reply(makeDebugError(requestId, "InvalidRequest", "send_object contains unknown or missing fields"), requestId);
+            return;
+        }
+
+        auto const generationValue = request->getProperty("generation");
+        auto const canvasPathValue = request->getProperty("canvas_path");
+        auto const objectOrdinalValue = request->getProperty("object_ordinal");
+        auto const selectorValue = request->getProperty("selector");
+        auto const atomsValue = request->getProperty("atoms");
+        if (!generationValue.isString() || !canvasPathValue.isArray()
+            || !(objectOrdinalValue.isInt() || objectOrdinalValue.isInt64())
+            || !selectorValue.isString() || !atomsValue.isArray()) {
+            reply(makeDebugError(requestId, "InvalidRequest", "send_object fields have invalid types"), requestId);
+            return;
+        }
+
+        String const generation = generationValue.toString();
+        String const selector = selectorValue.toString();
+        auto const* canvasPath = canvasPathValue.getArray();
+        auto const* atoms = atomsValue.getArray();
+        if (generation.isEmpty() || canvasPath == nullptr || canvasPath->size() > 32
+            || static_cast<int64>(objectOrdinalValue) < 0 || selector.isEmpty() || selector.getNumBytesAsUTF8() > 1024
+            || atoms == nullptr || atoms->size() > 256) {
+            reply(makeDebugError(requestId, "InvalidRequest", "send_object fields are out of bounds"), requestId);
+            return;
+        }
+
+        Array<int> path;
+        for (auto const& item : *canvasPath) {
+            if (!(item.isInt() || item.isInt64()) || static_cast<int64>(item) < 0 || static_cast<int64>(item) > INT_MAX) {
+                reply(makeDebugError(requestId, "InvalidRequest", "canvas_path must contain non-negative integers"), requestId);
+                return;
+            }
+            path.add(static_cast<int>(item));
+        }
+
+        for (auto const& atom : *atoms) {
+            if (atom.isString()) {
+                if (atom.toString().getNumBytesAsUTF8() > 2048) {
+                    reply(makeDebugError(requestId, "InvalidAtoms", "String atoms must not exceed 2048 UTF-8 bytes"), requestId);
+                    return;
+                }
+            } else if (!isFiniteDebugNumber(atom)) {
+                reply(makeDebugError(requestId, "InvalidAtoms", "Atoms must be finite numbers or strings"), requestId);
+                return;
+            }
+        }
+
+        if ((selector == "bang" && !atoms->isEmpty())
+            || (selector == "float" && (atoms->size() != 1 || !isFiniteDebugNumber(atoms->getFirst())) )
+            || (selector == "symbol" && (atoms->size() != 1 || !atoms->getFirst().isString()))) {
+            reply(makeDebugError(requestId, "InvalidAtoms", "Message selector and atom count do not match"), requestId);
+            return;
+        }
+
+        String runtimeError;
+        lockAudioThread();
+        if (debugGeneration != generation) {
+            runtimeError = "StaleGeneration";
+        } else if (!debugRoot || !debugRoot->isValid()) {
+            runtimeError = "CanvasNotFound";
+        } else {
+            auto* canvas = debugRoot->getRawUnchecked<t_canvas>();
+            if (pd_class(&canvas->gl_obj.ob_pd) != canvas_class) {
+                runtimeError = "CanvasNotFound";
+            } else {
+                for (auto const ordinal : path) {
+                    auto* object = canvas->gl_list;
+                    for (int index = 0; object && index < ordinal; ++index)
+                        object = object->g_next;
+                    if (!object) {
+                        runtimeError = "CanvasNotFound";
+                        break;
+                    }
+                    if (pd_class(&object->g_pd) != canvas_class) {
+                        runtimeError = "CanvasTypeMismatch";
+                        break;
+                    }
+                    canvas = reinterpret_cast<t_canvas*>(object);
+                }
+
+                if (runtimeError.isEmpty()) {
+                    auto* object = canvas->gl_list;
+                    auto const ordinal = static_cast<int>(objectOrdinalValue);
+                    for (int index = 0; object && index < ordinal; ++index)
+                        object = object->g_next;
+                    if (!object)
+                        runtimeError = "ObjectNotFound";
+                    else if (!pd::Interface::checkObject(&object->g_pd))
+                        runtimeError = "ObjectTypeMismatch";
+                    else {
+                        SmallArray<Atom> resolvedAtoms;
+                        resolvedAtoms.reserve(atoms->size());
+                        for (auto const& atom : *atoms)
+                            resolvedAtoms.add(atom.isString() ? Atom(generateSymbol(atom.toString())) : Atom(static_cast<float>(atom)));
+                        dispatchResolvedMessage(&object->g_pd, SmallString(selector), resolvedAtoms);
+                    }
+                }
+            }
+        }
+        unlockAudioThread();
+
+        if (runtimeError.isNotEmpty()) {
+            auto const message = runtimeError == "StaleGeneration" ? "Generation does not match the active generation" : "Debug target could not be resolved";
+            reply(makeDebugError(requestId, runtimeError, message), requestId);
+        } else {
+            reply(makeDebugInvocationSuccess(requestId), requestId);
+        }
         return;
     }
 

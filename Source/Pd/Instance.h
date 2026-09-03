@@ -331,6 +331,7 @@ private:
 
     void handleDebugMessage(Message const& message);
     void sendDebugReplyUnderLock(var const& response, int requestId);
+    void dispatchResolvedMessage(t_pd* object, SmallString const& selector, SmallArray<Atom> const& atoms);
     void clearDebugGeneration();
     bool isDebugGenerationActiveUnderLock(String const& generation) const;
 
