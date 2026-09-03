@@ -115,7 +115,10 @@ bool hasOnlySendObjectFields(DynamicObject const& request)
 
 bool isFiniteDebugNumber(var const& value)
 {
-    return value.isDouble() || value.isInt() || value.isInt64() ? std::isfinite(static_cast<double>(value)) : false;
+    if (!value.isDouble() && !value.isInt() && !value.isInt64())
+        return false;
+
+    return std::isfinite(static_cast<float>(static_cast<double>(value)));
 }
 
 class StrictJsonValidator {
@@ -1284,8 +1287,8 @@ void Instance::sendMessage(char const* receiver, char const* msg, SmallArray<Ato
 
 void Instance::processSend(dmessage const& mess)
 {
-    if (auto obj = mess.object.get<t_pd>()) {
-        dispatchResolvedMessage(obj.get(), mess.selector, mess.list);
+    if (mess.object.isValid()) {
+        dispatchResolvedMessage(mess.object.getRawUnchecked<t_pd>(), mess.selector, mess.list);
     } else {
         sendMessage(mess.destination.data(), mess.selector.data(), mess.list);
     }
@@ -1546,8 +1549,8 @@ void Instance::handleDebugMessage(Message const& message)
         String const selector = selectorValue.toString();
         auto const* canvasPath = canvasPathValue.getArray();
         auto const* atoms = atomsValue.getArray();
-        if (generation.isEmpty() || canvasPath == nullptr || canvasPath->size() > 32
-            || static_cast<int64>(objectOrdinalValue) < 0 || selector.isEmpty() || selector.getNumBytesAsUTF8() > 1024
+        if (generation.isEmpty() || generation.getNumBytesAsUTF8() > 128 || canvasPath == nullptr || canvasPath->size() > 32
+            || static_cast<int64>(objectOrdinalValue) < 0 || static_cast<int64>(objectOrdinalValue) > INT_MAX
             || atoms == nullptr || atoms->size() > 256) {
             reply(makeDebugError(requestId, "InvalidRequest", "send_object fields are out of bounds"), requestId);
             return;
@@ -1562,6 +1565,14 @@ void Instance::handleDebugMessage(Message const& message)
             path.add(static_cast<int>(item));
         }
 
+        if (selector.isEmpty() || selector.getNumBytesAsUTF8() > 1024
+            || (selector == "bang" && !atoms->isEmpty())
+            || (selector == "float" && atoms->size() != 1)
+            || (selector == "symbol" && atoms->size() != 1)) {
+            reply(makeDebugError(requestId, "InvalidSelector", "Selector is empty, too large, or has invalid arity"), requestId);
+            return;
+        }
+
         for (auto const& atom : *atoms) {
             if (atom.isString()) {
                 if (atom.toString().getNumBytesAsUTF8() > 2048) {
@@ -1574,10 +1585,9 @@ void Instance::handleDebugMessage(Message const& message)
             }
         }
 
-        if ((selector == "bang" && !atoms->isEmpty())
-            || (selector == "float" && (atoms->size() != 1 || !isFiniteDebugNumber(atoms->getFirst())) )
-            || (selector == "symbol" && (atoms->size() != 1 || !atoms->getFirst().isString()))) {
-            reply(makeDebugError(requestId, "InvalidAtoms", "Message selector and atom count do not match"), requestId);
+        if ((selector == "float" && !isFiniteDebugNumber(atoms->getFirst()))
+            || (selector == "symbol" && !atoms->getFirst().isString())) {
+            reply(makeDebugError(requestId, "InvalidAtoms", "Atoms must match the selector's required type"), requestId);
             return;
         }
 
@@ -1614,7 +1624,7 @@ void Instance::handleDebugMessage(Message const& message)
                         object = object->g_next;
                     if (!object)
                         runtimeError = "ObjectNotFound";
-                    else if (!pd::Interface::checkObject(&object->g_pd))
+                    else if (auto* resolvedObject = pd::Interface::checkObject(&object->g_pd); !resolvedObject || resolvedObject->te_type != T_OBJECT)
                         runtimeError = "ObjectTypeMismatch";
                     else {
                         SmallArray<Atom> resolvedAtoms;
