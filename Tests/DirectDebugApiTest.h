@@ -154,6 +154,45 @@ private:
         sendJson(JSON::toString(makeSetGenerationRequest(22, "generation-1", rootReceiver), true) + " \n\t", 22, true, {});
         sendJson("{\"version\":1,\"request_id\":23,\"operation\":\"unknown\",\"padding\":\"}]\"}", 23, false, "UnknownOperation");
 
+        sendJson("{\"version\":1,\"request_id\":24,\"operation\":\"set_generation\",\"generation\":'g',\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":25,\"operation\":\"set_generation\",\"generation\":\"g\\q\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":25,\"operation\":\"set_generation\",\"generation\":\"g\\a\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":32,\"operation\":\"set_generation\",\"generation\":\"g\\u0000tail\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":26,\"operation\":\"set_generation\",\"generation\":\"g" + String::charToString('\n') + "\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":027,\"operation\":\"set_generation\",\"generation\":\"g\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":- 1,\"operation\":\"set_generation\",\"generation\":\"g\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":30.,\"operation\":\"set_generation\",\"generation\":\"g\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":31e+,\"operation\":\"set_generation\",\"generation\":\"g\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidEnvelope");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1e0,\"request_id\":28,\"operation\":\"set_generation\",\"generation\":\"g\",\"root_receiver\":\"" + rootReceiver + "\"}", 28, false, "UnsupportedProtocolVersion");
+        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationActive = true;
+
+        String validEscapedGeneration = "g\"\\/";
+        for (auto const control : { '\b', '\f', '\n', '\r', '\t' })
+            validEscapedGeneration += String::charToString(control);
+        validEscapedGeneration += "h";
+        sendJson("{\"version\":1,\"request_id\":29,\"operation\":\"set_generation\",\"generation\":\"g\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0068\",\"root_receiver\":\"" + rootReceiver + "\"}", 29, true, {});
+        expectedReplies.back().generationProbe = validEscapedGeneration;
+        expectedReplies.back().generationActive = true;
+
         String const largePrefix = "{\"version\":1,\"request_id\":20,\"operation\":\"unknown\",\"padding\":\"";
         String const largeSuffix = "\"}";
         auto const paddingBytes = maxDecodedRequestBytes - largePrefix.getNumBytesAsUTF8() - largeSuffix.getNumBytesAsUTF8();
@@ -179,7 +218,7 @@ private:
         sendJson("{\"version\":1,\"request_id\":11,\"operation\":\"unknown\",\"extra\":true}", 11, false, "UnknownOperation");
 
         sendRequest(makeSetGenerationRequest(12, "g", rootReceiver, true), 12, false, "InvalidRequest");
-        expectedReplies.back().generationProbe = "generation-1";
+        expectedReplies.back().generationProbe = validEscapedGeneration;
         expectedReplies.back().generationActive = false;
         sendJson("{\"version\":1,\"request_id\":13,\"operation\":\"set_generation\",\"root_receiver\":\"r\"}", 13, false, "InvalidRequest");
         sendRequest(makeSetGenerationRequest(14, true, rootReceiver), 14, false, "InvalidRequest");

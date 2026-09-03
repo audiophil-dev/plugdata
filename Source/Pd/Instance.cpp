@@ -12,6 +12,7 @@
 #include "Dialogs/Dialogs.h"
 
 #include <algorithm>
+#include <string_view>
 #include "Instance.h"
 #include "Patch.h"
 #include "MessageListener.h"
@@ -81,41 +82,210 @@ bool hasOnlySetGenerationFields(DynamicObject const& request)
     return true;
 }
 
-bool hasSingleCompleteJsonValue(String const& json)
-{
-    auto cursor = json.getCharPointer().findEndOfWhitespace();
-    if (*cursor != '{' && *cursor != '[')
-        return false;
+class StrictJsonValidator {
+public:
+    explicit StrictJsonValidator(std::string_view const input)
+        : text(input)
+    {
+    }
 
-    std::vector<juce_wchar> delimiters;
-    bool insideString = false;
-    bool escaped = false;
-    while (!cursor.isEmpty()) {
-        auto const character = cursor.getAndAdvance();
-        if (insideString) {
-            if (escaped)
-                escaped = false;
-            else if (character == '\\')
-                escaped = true;
-            else if (character == '"')
-                insideString = false;
-        } else if (character == '"') {
-            insideString = true;
-        } else if (character == '{' || character == '[') {
-            delimiters.push_back(character);
-        } else if (character == '}' || character == ']') {
-            if (delimiters.empty()
-                || (character == '}' && delimiters.back() != '{')
-                || (character == ']' && delimiters.back() != '['))
-                return false;
+    bool parse()
+    {
+        skipWhitespace();
+        if (position == text.size() || (text[position] != '{' && text[position] != '['))
+            return false;
 
-            delimiters.pop_back();
-            if (delimiters.empty())
-                return cursor.findEndOfWhitespace().isEmpty();
+        if (!parseValue(0))
+            return false;
+
+        skipWhitespace();
+        return position == text.size();
+    }
+
+private:
+    static constexpr int maxNestingDepth = 128;
+
+    static bool isDigit(char const character)
+    {
+        return character >= '0' && character <= '9';
+    }
+
+    static bool isHexDigit(char const character)
+    {
+        return isDigit(character)
+            || (character >= 'a' && character <= 'f')
+            || (character >= 'A' && character <= 'F');
+    }
+
+    void skipWhitespace()
+    {
+        while (position < text.size()
+            && (text[position] == ' ' || text[position] == '\t' || text[position] == '\n' || text[position] == '\r'))
+            ++position;
+    }
+
+    bool consume(char const character)
+    {
+        if (position == text.size() || text[position] != character)
+            return false;
+
+        ++position;
+        return true;
+    }
+
+    bool consume(std::string_view const value)
+    {
+        if (text.substr(position, value.size()) != value)
+            return false;
+
+        position += value.size();
+        return true;
+    }
+
+    bool parseValue(int const depth)
+    {
+        if (depth > maxNestingDepth || position == text.size())
+            return false;
+
+        switch (text[position]) {
+        case '{':
+            return parseObject(depth);
+        case '[':
+            return parseArray(depth);
+        case '"':
+            return parseString();
+        case 't':
+            return consume("true");
+        case 'f':
+            return consume("false");
+        case 'n':
+            return consume("null");
+        default:
+            return parseNumber();
         }
     }
-    return false;
-}
+
+    bool parseObject(int const depth)
+    {
+        consume('{');
+        skipWhitespace();
+        if (consume('}'))
+            return true;
+
+        for (;;) {
+            if (!parseString())
+                return false;
+
+            skipWhitespace();
+            if (!consume(':'))
+                return false;
+
+            skipWhitespace();
+            if (!parseValue(depth + 1))
+                return false;
+
+            skipWhitespace();
+            if (consume('}'))
+                return true;
+            if (!consume(','))
+                return false;
+            skipWhitespace();
+        }
+    }
+
+    bool parseArray(int const depth)
+    {
+        consume('[');
+        skipWhitespace();
+        if (consume(']'))
+            return true;
+
+        for (;;) {
+            if (!parseValue(depth + 1))
+                return false;
+
+            skipWhitespace();
+            if (consume(']'))
+                return true;
+            if (!consume(','))
+                return false;
+            skipWhitespace();
+        }
+    }
+
+    bool parseString()
+    {
+        if (!consume('"'))
+            return false;
+
+        while (position < text.size()) {
+            auto const character = static_cast<unsigned char>(text[position++]);
+            if (character == '"')
+                return true;
+            if (character < 0x20)
+                return false;
+            if (character != '\\')
+                continue;
+            if (position == text.size())
+                return false;
+
+            auto const escaped = text[position++];
+            if (escaped == '"' || escaped == '\\' || escaped == '/' || escaped == 'b'
+                || escaped == 'f' || escaped == 'n' || escaped == 'r' || escaped == 't')
+                continue;
+            if (escaped != 'u' || position + 4 > text.size())
+                return false;
+
+            bool nullEscape = true;
+            for (int index = 0; index < 4; ++index) {
+                if (!isHexDigit(text[position]))
+                    return false;
+                nullEscape = nullEscape && text[position] == '0';
+                ++position;
+            }
+            if (nullEscape)
+                return false;
+        }
+        return false;
+    }
+
+    bool parseNumber()
+    {
+        if (consume('-') && position == text.size())
+            return false;
+
+        if (consume('0')) {
+            if (position < text.size() && isDigit(text[position]))
+                return false;
+        } else {
+            if (position == text.size() || text[position] < '1' || text[position] > '9')
+                return false;
+            while (position < text.size() && isDigit(text[position]))
+                ++position;
+        }
+
+        if (consume('.')) {
+            if (position == text.size() || !isDigit(text[position]))
+                return false;
+            while (position < text.size() && isDigit(text[position]))
+                ++position;
+        }
+
+        if (position < text.size() && (text[position] == 'e' || text[position] == 'E')) {
+            ++position;
+            if (position < text.size() && (text[position] == '+' || text[position] == '-'))
+                ++position;
+            if (position == text.size() || !isDigit(text[position]))
+                return false;
+            while (position < text.size() && isDigit(text[position]))
+                ++position;
+        }
+        return true;
+    }
+
+    std::string_view text;
+    size_t position = 0;
+};
 }
 
 class ConsoleMessageHandler final : public Timer {
@@ -1182,12 +1352,12 @@ void Instance::handleDebugMessage(Message const& message)
         return;
     }
 
-    String const json = String::fromUTF8(decodedBytes, decodedSize);
-    if (!hasSingleCompleteJsonValue(json)) {
-        reply(makeDebugError(0, "InvalidEnvelope", "Decoded request must contain exactly one JSON value"), 0);
+    if (!StrictJsonValidator(std::string_view(decodedBytes, static_cast<size_t>(decodedSize))).parse()) {
+        reply(makeDebugError(0, "InvalidEnvelope", "Decoded request must contain strict JSON"), 0);
         return;
     }
 
+    String const json = String::fromUTF8(decodedBytes, decodedSize);
     var envelope;
     auto const parseResult = JSON::parse(json, envelope);
     auto* request = envelope.getDynamicObject();
