@@ -193,6 +193,9 @@ private:
         expectedReplies.back().generationProbe = validEscapedGeneration;
         expectedReplies.back().generationActive = true;
 
+        String const oracleOverflow = "18446744073709551617";
+        String const veryLongInteger = String::repeatedString("9", 4096);
+
         String const largePrefix = "{\"version\":1,\"request_id\":20,\"operation\":\"unknown\",\"padding\":\"";
         String const largeSuffix = "\"}";
         auto const paddingBytes = maxDecodedRequestBytes - largePrefix.getNumBytesAsUTF8() - largeSuffix.getNumBytesAsUTF8();
@@ -208,10 +211,30 @@ private:
         sendJson("{\"version\":1,\"request_id\":\"1\",\"operation\":\"set_generation\"}", 0, false, "InvalidRequest");
         sendJson("{\"version\":1,\"request_id\":0,\"operation\":\"set_generation\"}", 0, false, "InvalidRequest");
         sendJson("{\"version\":1,\"request_id\":-1,\"operation\":\"set_generation\"}", 0, false, "InvalidRequest");
-        sendJson("{\"version\":1,\"request_id\":16777216,\"operation\":\"set_generation\"}", 0, false, "InvalidRequest");
+        sendJson("{\"version\":1,\"request_id\":16777216,\"operation\":\"set_generation\",\"generation\":\"overflow-id\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidRequest");
+        expectedReplies.back().generationProbe = validEscapedGeneration;
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":" + oracleOverflow + ",\"operation\":\"set_generation\",\"generation\":\"overflow-id\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidRequest");
+        expectedReplies.back().generationProbe = validEscapedGeneration;
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":-" + oracleOverflow + ",\"operation\":\"set_generation\",\"generation\":\"overflow-id\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidRequest");
+        expectedReplies.back().generationProbe = validEscapedGeneration;
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":1,\"request_id\":" + veryLongInteger + ",\"operation\":\"set_generation\",\"generation\":\"overflow-id\",\"root_receiver\":\"" + rootReceiver + "\"}", 0, false, "InvalidRequest");
+        expectedReplies.back().generationProbe = validEscapedGeneration;
+        expectedReplies.back().generationActive = true;
         sendJson("{\"version\":1,\"request_id\":true,\"operation\":\"set_generation\"}", 0, false, "InvalidRequest");
 
         sendJson("{\"version\":2,\"request_id\":7,\"operation\":\"set_generation\"}", 7, false, "UnsupportedProtocolVersion");
+        sendJson("{\"version\":" + oracleOverflow + ",\"request_id\":33,\"operation\":\"set_generation\",\"generation\":\"overflow-version\",\"root_receiver\":\"" + rootReceiver + "\"}", 33, false, "UnsupportedProtocolVersion");
+        expectedReplies.back().generationProbe = validEscapedGeneration;
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":-" + oracleOverflow + ",\"request_id\":34,\"operation\":\"set_generation\",\"generation\":\"overflow-version\",\"root_receiver\":\"" + rootReceiver + "\"}", 34, false, "UnsupportedProtocolVersion");
+        expectedReplies.back().generationProbe = validEscapedGeneration;
+        expectedReplies.back().generationActive = true;
+        sendJson("{\"version\":" + veryLongInteger + ",\"request_id\":35,\"operation\":\"set_generation\",\"generation\":\"overflow-version\",\"root_receiver\":\"" + rootReceiver + "\"}", 35, false, "UnsupportedProtocolVersion");
+        expectedReplies.back().generationProbe = validEscapedGeneration;
+        expectedReplies.back().generationActive = true;
         sendJson("{\"request_id\":8,\"operation\":\"set_generation\"}", 8, false, "UnsupportedProtocolVersion");
         sendJson("{\"version\":1,\"request_id\":9,\"operation\":\"unknown\"}", 9, false, "UnknownOperation");
         sendJson("{\"version\":2,\"request_id\":10,\"operation\":\"unknown\",\"extra\":true}", 10, false, "UnsupportedProtocolVersion");

@@ -84,6 +84,11 @@ bool hasOnlySetGenerationFields(DynamicObject const& request)
 
 class StrictJsonValidator {
 public:
+    struct Field {
+        std::string_view value;
+        int occurrences = 0;
+    };
+
     explicit StrictJsonValidator(std::string_view const input)
         : text(input)
     {
@@ -95,12 +100,17 @@ public:
         if (position == text.size() || (text[position] != '{' && text[position] != '['))
             return false;
 
+        objectRoot = text[position] == '{';
         if (!parseValue(0))
             return false;
 
         skipWhitespace();
         return position == text.size();
     }
+
+    bool hasObjectRoot() const { return objectRoot; }
+    Field const& getRequestId() const { return requestId; }
+    Field const& getVersion() const { return version; }
 
 private:
     static constexpr int maxNestingDepth = 128;
@@ -115,6 +125,36 @@ private:
         return isDigit(character)
             || (character >= 'a' && character <= 'f')
             || (character >= 'A' && character <= 'F');
+    }
+
+    static int hexDigitValue(char const character)
+    {
+        if (isDigit(character))
+            return character - '0';
+        if (character >= 'a' && character <= 'f')
+            return character - 'a' + 10;
+        return character - 'A' + 10;
+    }
+
+    static bool propertyNameMatches(std::string_view const encoded, std::string_view const expected)
+    {
+        size_t expectedPosition = 0;
+        for (size_t encodedPosition = 0; encodedPosition < encoded.size();) {
+            int character = static_cast<unsigned char>(encoded[encodedPosition++]);
+            if (character == '\\') {
+                if (encodedPosition == encoded.size() || encoded[encodedPosition++] != 'u')
+                    return false;
+
+                character = 0;
+                for (int digit = 0; digit < 4; ++digit)
+                    character = character * 16 + hexDigitValue(encoded[encodedPosition++]);
+            }
+
+            if (expectedPosition == expected.size()
+                || character != static_cast<unsigned char>(expected[expectedPosition++]))
+                return false;
+        }
+        return expectedPosition == expected.size();
     }
 
     void skipWhitespace()
@@ -173,7 +213,8 @@ private:
             return true;
 
         for (;;) {
-            if (!parseString())
+            std::string_view propertyName;
+            if (!parseString(&propertyName))
                 return false;
 
             skipWhitespace();
@@ -181,8 +222,11 @@ private:
                 return false;
 
             skipWhitespace();
+            auto const valueStart = position;
             if (!parseValue(depth + 1))
                 return false;
+            if (depth == 0)
+                captureTopLevelField(propertyName, text.substr(valueStart, position - valueStart));
 
             skipWhitespace();
             if (consume('}'))
@@ -213,15 +257,19 @@ private:
         }
     }
 
-    bool parseString()
+    bool parseString(std::string_view* const contents = nullptr)
     {
         if (!consume('"'))
             return false;
 
+        auto const contentStart = position;
         while (position < text.size()) {
             auto const character = static_cast<unsigned char>(text[position++]);
-            if (character == '"')
+            if (character == '"') {
+                if (contents)
+                    *contents = text.substr(contentStart, position - contentStart - 1);
                 return true;
+            }
             if (character < 0x20)
                 return false;
             if (character != '\\')
@@ -247,6 +295,17 @@ private:
                 return false;
         }
         return false;
+    }
+
+    void captureTopLevelField(std::string_view const propertyName, std::string_view const value)
+    {
+        if (propertyNameMatches(propertyName, "request_id")) {
+            requestId.value = value;
+            ++requestId.occurrences;
+        } else if (propertyNameMatches(propertyName, "version")) {
+            version.value = value;
+            ++version.occurrences;
+        }
     }
 
     bool parseNumber()
@@ -285,7 +344,28 @@ private:
 
     std::string_view text;
     size_t position = 0;
+    bool objectRoot = false;
+    Field requestId;
+    Field version;
 };
+
+bool parseDebugRequestId(std::string_view const lexeme, int& requestId)
+{
+    if (lexeme.empty())
+        return false;
+
+    requestId = 0;
+    for (auto const character : lexeme) {
+        if (character < '0' || character > '9')
+            return false;
+
+        auto const digit = character - '0';
+        if (requestId > (maxDebugRequestId - digit) / 10)
+            return false;
+        requestId = requestId * 10 + digit;
+    }
+    return requestId >= 1;
+}
 }
 
 class ConsoleMessageHandler final : public Timer {
@@ -1352,8 +1432,27 @@ void Instance::handleDebugMessage(Message const& message)
         return;
     }
 
-    if (!StrictJsonValidator(std::string_view(decodedBytes, static_cast<size_t>(decodedSize))).parse()) {
+    StrictJsonValidator validator(std::string_view(decodedBytes, static_cast<size_t>(decodedSize)));
+    if (!validator.parse()) {
         reply(makeDebugError(0, "InvalidEnvelope", "Decoded request must contain strict JSON"), 0);
+        return;
+    }
+
+    if (!validator.hasObjectRoot()) {
+        reply(makeDebugError(0, "InvalidEnvelope", "Decoded request must be a JSON object"), 0);
+        return;
+    }
+
+    int requestId = 0;
+    auto const& requestIdField = validator.getRequestId();
+    if (requestIdField.occurrences != 1 || !parseDebugRequestId(requestIdField.value, requestId)) {
+        reply(makeDebugError(0, "InvalidRequest", "request_id must be an integer from 1 through 16777215"), 0);
+        return;
+    }
+
+    auto const& versionField = validator.getVersion();
+    if (versionField.occurrences != 1 || versionField.value != "1") {
+        reply(makeDebugError(requestId, "UnsupportedProtocolVersion", "Only protocol version 1 is supported"), requestId);
         return;
     }
 
@@ -1363,21 +1462,6 @@ void Instance::handleDebugMessage(Message const& message)
     auto* request = envelope.getDynamicObject();
     if (parseResult.failed() || !request) {
         reply(makeDebugError(0, "InvalidEnvelope", "Decoded request must be a JSON object"), 0);
-        return;
-    }
-
-    auto const requestIdValue = request->getProperty("request_id");
-    if ((!requestIdValue.isInt() && !requestIdValue.isInt64())
-        || static_cast<int64>(requestIdValue) < 1
-        || static_cast<int64>(requestIdValue) > maxDebugRequestId) {
-        reply(makeDebugError(0, "InvalidRequest", "request_id must be an integer from 1 through 16777215"), 0);
-        return;
-    }
-    auto const requestId = static_cast<int>(requestIdValue);
-
-    auto const version = request->getProperty("version");
-    if ((!version.isInt() && !version.isInt64()) || static_cast<int64>(version) != debugProtocolVersion) {
-        reply(makeDebugError(requestId, "UnsupportedProtocolVersion", "Only protocol version 1 is supported"), requestId);
         return;
     }
 
