@@ -582,12 +582,13 @@ public:
         while (!pendingMessages.empty()) {
             auto& [object, message, type] = pendingMessages.front();
             addMessage(object, message.toString(), type);
-            pendingMessages.pop_front();
 
             summary.numReceived++;
             summary.anyWarning = summary.anyWarning || (type != 0);
             summary.lastMessage = message;
             summary.lastWasWarning = (type != 0);
+
+            pendingMessages.pop_front();
         }
         pendingLock.exit();
         return summary;
