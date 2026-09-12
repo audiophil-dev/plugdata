@@ -1,4 +1,6 @@
 #include "Pd/Setup.h"
+#include "Sidebar/Console.h"
+#include <thread>
 
 class DirectDebugApiTest : public PlugDataUnitTest, private Timer
 {
@@ -78,6 +80,100 @@ private:
         var atomList = atoms;
         request->setProperty("atoms", atomList);
         return var(request);
+    }
+
+    static var makeGetConsoleRequest(int const requestId, bool const includeHistory, int const maxEntries)
+    {
+        auto* request = new DynamicObject();
+        request->setProperty("version", 1);
+        request->setProperty("request_id", requestId);
+        request->setProperty("operation", "get_console");
+        request->setProperty("include_history", includeHistory);
+        request->setProperty("max_entries", maxEntries);
+        return var(request);
+    }
+
+    static var makeClearConsoleRequest(int const requestId)
+    {
+        auto* request = new DynamicObject();
+        request->setProperty("version", 1);
+        request->setProperty("request_id", requestId);
+        request->setProperty("operation", "clear_console");
+        return var(request);
+    }
+
+    void consoleBegin()
+    {
+        responses.clear();
+        expectedReplies.clear();
+    }
+
+    void consoleInject(String const& text, int const severity)
+    {
+        if (severity == 0)
+            editor->pd->logMessage(text);
+        else if (severity == 1)
+            editor->pd->logWarning(text);
+        else
+            editor->pd->logError(text);
+    }
+
+    void checkConsoleReply(int const responseIndex, int const expectedId, bool const ok, String const& errorCode)
+    {
+        check(responseIndex < responses.size(), "console reply must be received");
+        if (responseIndex >= responses.size())
+            return;
+        auto* response = responses[responseIndex].getDynamicObject();
+        check(response != nullptr, "console reply must be an object");
+        if (!response)
+            return;
+        check(static_cast<int>(response->getProperty("request_id")) == expectedId, "console reply request_id must correlate");
+        check(static_cast<bool>(response->getProperty("ok")) == ok, "console reply ok must match for request " + String(expectedId));
+        if (!ok) {
+            auto* error = response->getProperty("error").getDynamicObject();
+            check(error != nullptr, "console error reply must contain an error object");
+            if (error)
+                check(error->getProperty("code").isString() && error->getProperty("code").toString() == errorCode,
+                    "console error code must match for request " + String(expectedId));
+        }
+    }
+
+    Array<var> const* consoleEntries(int const responseIndex) const
+    {
+        if (responseIndex >= responses.size())
+            return nullptr;
+        auto* response = responses[responseIndex].getDynamicObject();
+        if (!response)
+            return nullptr;
+        auto* data = response->getProperty("data").getDynamicObject();
+        if (!data)
+            return nullptr;
+        return data->getProperty("entries").getArray();
+    }
+
+    bool consoleTruncated(int const responseIndex) const
+    {
+        if (responseIndex >= responses.size())
+            return false;
+        auto* response = responses[responseIndex].getDynamicObject();
+        if (!response)
+            return false;
+        auto* data = response->getProperty("data").getDynamicObject();
+        if (!data)
+            return false;
+        return static_cast<bool>(data->getProperty("truncated"));
+    }
+
+    void checkConsoleEntry(var const& entry, String const& text, String const& severity, int const repeats, String const& source, String const& description)
+    {
+        auto* obj = entry.getDynamicObject();
+        check(obj != nullptr, description + " entry must be an object");
+        if (!obj)
+            return;
+        check(obj->getProperty("text").isString() && obj->getProperty("text").toString() == text, description + " text must match");
+        check(obj->getProperty("severity").isString() && obj->getProperty("severity").toString() == severity, description + " severity must match");
+        check(obj->getProperty("repeats").isInt() && static_cast<int>(obj->getProperty("repeats")) == repeats, description + " repeats must match");
+        check(obj->getProperty("source").isString() && obj->getProperty("source").toString() == source, description + " source must match");
     }
 
     void sendWire(String const& selector, SmallArray<pd::Atom> const& atoms, int const requestId, bool const ok, String const& errorCode)
@@ -395,6 +491,10 @@ private:
     void timerCallback() override
     {
         stopTimer();
+        if (consoleStep >= 0) {
+            advanceConsoleStep();
+            return;
+        }
         if (lifetimeStage == 0) {
             checkExpectedPrintLines("print hook must receive exact root and nested lines for every message form");
             check(rootCanvas && rootCanvas->patch.getCanvasContent() == originalCanvasContent,
@@ -514,8 +614,7 @@ private:
         }
 
         editor->pd->lockAudioThread();
-        if (replyReceiver)
-            pd_free(static_cast<t_pd*>(replyReceiver));
+        // replyReceiver stays bound for the console phase that follows.
         if (nonCanvasReceiver)
             pd_free(static_cast<t_pd*>(nonCanvasReceiver));
         pd_unbind(static_cast<t_pd*>(printHook), gensym("#plugdata_print"));
@@ -532,6 +631,355 @@ private:
         auto& tabbar = editor->getTabComponent();
         while (auto* canvas = tabbar.getCurrentCanvas())
             tabbar.closeTab(canvas);
+
+        setupConsole();
+    }
+
+    void setupConsole()
+    {
+        auto* sidebar = editor->getSidebarForPanel(Sidebar::ConsolePanel);
+        consoleComponent = TestHelpers::findChildOfType<Console::ConsoleComponent>(sidebar);
+        check(consoleComponent != nullptr, "the console component must be reachable for GUI clear/restore verification");
+
+        consoleStep = 0;
+        consoleBegin();
+        sendRequest(makeClearConsoleRequest(100), 100, true, {});
+        startTimer(5000);
+    }
+
+    void runConcurrentProducerProof()
+    {
+        // Producer A enqueues a warning and signals only after its enqueue
+        // completes (the pending mutex is released).
+        producerThreadA = std::thread([this] {
+            editor->pd->logWarning("producer-A");
+            producerAEnqueued.signal();
+        });
+        producerAEnqueued.wait();
+        producerThreadA.join();
+
+        // Producer B blocks until clear_console's critical section has ended,
+        // then enqueues an error.
+        producerThreadB = std::thread([this] {
+            allowProducerB.wait();
+            editor->pd->logError("producer-B");
+            producerBEnqueued.signal();
+        });
+
+        consoleBegin();
+        sendRequest(makeClearConsoleRequest(121), 121, true, {});
+        consoleStep = 16;
+        startTimer(5000);
+    }
+
+    void advanceConsoleStep()
+    {
+        switch (consoleStep) {
+        case 0: {
+            checkConsoleReply(0, 100, true, "");
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().empty(), "baseline clear must empty both stores");
+
+            consoleInject("sev-message", 0);
+            consoleInject("sev-warning", 1);
+            consoleInject("sev-error", 2);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(101, false, 200), 101, true, {});
+            consoleStep = 1;
+            startTimer(5000);
+            break;
+        }
+        case 1: {
+            checkConsoleReply(0, 101, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 3, "severity snapshot must contain exactly three entries");
+            if (entries && entries->size() == 3) {
+                checkConsoleEntry(entries->getReference(0), "sev-message", "message", 1, "visible", "message entry");
+                checkConsoleEntry(entries->getReference(1), "sev-warning", "warning", 1, "visible", "warning entry");
+                checkConsoleEntry(entries->getReference(2), "sev-error", "error", 1, "visible", "error entry");
+            }
+            check(!consoleTruncated(0), "severity snapshot must not be truncated");
+
+            consoleInject("dup", 1);
+            consoleInject("dup", 1);
+            consoleInject("dup", 2);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(102, false, 200), 102, true, {});
+            consoleStep = 2;
+            startTimer(5000);
+            break;
+        }
+        case 2: {
+            checkConsoleReply(0, 102, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 5, "repeat snapshot must contain exactly five entries");
+            if (entries && entries->size() == 5) {
+                checkConsoleEntry(entries->getReference(3), "dup", "warning", 2, "visible", "matching text+severity must collapse");
+                checkConsoleEntry(entries->getReference(4), "dup", "error", 1, "visible", "differing severity must not collapse");
+            }
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(110), 110, true, {});
+            consoleStep = 3;
+            startTimer(5000);
+            break;
+        }
+        case 3: {
+            checkConsoleReply(0, 110, true, "");
+
+            for (int i = 0; i < 810; ++i)
+                consoleInject("cap-" + String(i), 0);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(103, false, 200), 103, true, {});
+            consoleStep = 4;
+            startTimer(5000);
+            break;
+        }
+        case 4: {
+            checkConsoleReply(0, 103, true, "");
+            check(editor->pd->getConsoleMessages().size() == 800, "visible retention cap must stay at 800");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 200, "bounded snapshot must return at most 200 entries");
+            if (entries && entries->size() == 200) {
+                checkConsoleEntry(entries->getReference(0), "cap-610", "message", 1, "visible", "newest suffix oldest entry");
+                checkConsoleEntry(entries->getReference(199), "cap-809", "message", 1, "visible", "newest suffix newest entry");
+            }
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(111), 111, true, {});
+            consoleStep = 5;
+            startTimer(5000);
+            break;
+        }
+        case 5: {
+            checkConsoleReply(0, 111, true, "");
+
+            for (int i = 1; i <= 5; ++i)
+                consoleInject("order-" + String(i), 0);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(104, false, 1), 104, true, {});
+            sendRequest(makeGetConsoleRequest(105, false, 3), 105, true, {});
+            sendRequest(makeGetConsoleRequest(106, false, 200), 106, true, {});
+            sendRequest(makeGetConsoleRequest(107, false, 201), 107, false, "InvalidRequest");
+            sendRequest(makeGetConsoleRequest(108, false, 0), 108, false, "InvalidRequest");
+            consoleStep = 6;
+            startTimer(5000);
+            break;
+        }
+        case 6: {
+            checkConsoleReply(0, 104, true, "");
+            checkConsoleReply(1, 105, true, "");
+            checkConsoleReply(2, 106, true, "");
+            checkConsoleReply(3, 107, false, "InvalidRequest");
+            checkConsoleReply(4, 108, false, "InvalidRequest");
+
+            auto const* one = consoleEntries(0);
+            check(one != nullptr && one->size() == 1, "max_entries=1 must return exactly one entry");
+            if (one && one->size() == 1)
+                checkConsoleEntry(one->getReference(0), "order-5", "message", 1, "visible", "max_entries=1 selects the newest entry");
+
+            auto const* three = consoleEntries(1);
+            check(three != nullptr && three->size() == 3, "max_entries=3 must return exactly three entries");
+            if (three && three->size() == 3) {
+                checkConsoleEntry(three->getReference(0), "order-3", "message", 1, "visible", "newest suffix oldest");
+                checkConsoleEntry(three->getReference(1), "order-4", "message", 1, "visible", "newest suffix middle");
+                checkConsoleEntry(three->getReference(2), "order-5", "message", 1, "visible", "newest suffix newest");
+            }
+
+            auto const* all = consoleEntries(2);
+            check(all != nullptr && all->size() == 5, "max_entries=200 must return all five entries");
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(112), 112, true, {});
+            consoleStep = 7;
+            startTimer(5000);
+            break;
+        }
+        case 7: {
+            checkConsoleReply(0, 112, true, "");
+
+            consoleInject("hist-a", 0);
+            consoleInject("hist-b", 1);
+            consoleInject("hist-c", 2);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(109, true, 200), 109, true, {});
+            consoleStep = 8;
+            startTimer(5000);
+            break;
+        }
+        case 8: {
+            checkConsoleReply(0, 109, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 3, "history snapshot must contain exactly three visible entries");
+            if (entries && entries->size() == 3) {
+                checkConsoleEntry(entries->getReference(0), "hist-a", "message", 1, "visible", "visible entry a");
+                checkConsoleEntry(entries->getReference(1), "hist-b", "warning", 1, "visible", "visible entry b");
+                checkConsoleEntry(entries->getReference(2), "hist-c", "error", 1, "visible", "visible entry c");
+            }
+
+            // Reversible GUI clear moves visible into history.
+            if (consoleComponent)
+                consoleComponent->clear();
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().size() == 3,
+                "GUI clear must move visible entries into history");
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(113, false, 200), 113, true, {});
+            sendRequest(makeGetConsoleRequest(114, true, 200), 114, true, {});
+            consoleStep = 9;
+            startTimer(5000);
+            break;
+        }
+        case 9: {
+            checkConsoleReply(0, 113, true, "");
+            checkConsoleReply(1, 114, true, "");
+
+            auto const* visible = consoleEntries(0);
+            check(visible != nullptr && visible->isEmpty(), "include_history=false must exclude history after GUI clear");
+
+            auto const* withHistory = consoleEntries(1);
+            check(withHistory != nullptr && withHistory->size() == 3, "include_history=true must surface history entries");
+            if (withHistory && withHistory->size() == 3) {
+                checkConsoleEntry(withHistory->getReference(0), "hist-a", "message", 1, "history", "history entry a");
+                checkConsoleEntry(withHistory->getReference(1), "hist-b", "warning", 1, "history", "history entry b");
+                checkConsoleEntry(withHistory->getReference(2), "hist-c", "error", 1, "history", "history entry c");
+            }
+
+            // Reversible GUI restore moves history back into visible.
+            if (consoleComponent)
+                consoleComponent->restore();
+            check(editor->pd->getConsoleMessages().size() == 3 && editor->pd->getConsoleHistory().empty(),
+                "GUI restore must move history back into visible");
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(115, true, 200), 115, true, {});
+            consoleStep = 10;
+            startTimer(5000);
+            break;
+        }
+        case 10: {
+            checkConsoleReply(0, 115, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 3, "restored entries must be visible again");
+            if (entries && entries->size() == 3)
+                checkConsoleEntry(entries->getReference(2), "hist-c", "error", 1, "visible", "restored entry c");
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(116), 116, true, {});
+            consoleStep = 11;
+            startTimer(5000);
+            break;
+        }
+        case 11: {
+            checkConsoleReply(0, 116, true, "");
+
+            consoleInject("small-keep", 0);
+            consoleInject(String::repeatedString("z", 70 * 1024), 0);
+            consoleInject("small-after", 0);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(117, false, 200), 117, true, {});
+            consoleStep = 12;
+            startTimer(5000);
+            break;
+        }
+        case 12: {
+            checkConsoleReply(0, 117, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 1, "oversized entry must be omitted rather than split");
+            if (entries && entries->size() == 1)
+                checkConsoleEntry(entries->getReference(0), "small-keep", "message", 1, "visible", "pre-overflow entry survives");
+            check(consoleTruncated(0), "oversized-entry snapshot must be truncated");
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(118), 118, true, {});
+            consoleStep = 13;
+            startTimer(5000);
+            break;
+        }
+        case 13: {
+            checkConsoleReply(0, 118, true, "");
+
+            consoleInject("wipe-a", 0);
+            consoleInject("wipe-b", 1);
+            consoleInject("wipe-c", 2);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(119, true, 200), 119, true, {});
+            consoleStep = 14;
+            startTimer(5000);
+            break;
+        }
+        case 14: {
+            checkConsoleReply(0, 119, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 3, "wipe pre-snapshot must contain three entries");
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(120), 120, true, {});
+            consoleStep = 15;
+            startTimer(5000);
+            break;
+        }
+        case 15: {
+            checkConsoleReply(0, 120, true, "");
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().empty(),
+                "hard clear must remove visible and history");
+
+            runConcurrentProducerProof();
+            break;
+        }
+        case 16: {
+            checkConsoleReply(0, 121, true, "");
+            // clear_console's critical section has ended; release producer B.
+            allowProducerB.signal();
+            producerBEnqueued.wait();
+            producerThreadB.join();
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(122, false, 200), 122, true, {});
+            consoleStep = 17;
+            startTimer(5000);
+            break;
+        }
+        case 17: {
+            checkConsoleReply(0, 122, true, "");
+            auto const* entries = consoleEntries(0);
+            bool sawA = false;
+            bool sawB = false;
+            if (entries) {
+                for (auto const& entry : *entries) {
+                    auto* obj = entry.getDynamicObject();
+                    if (!obj)
+                        continue;
+                    auto const text = obj->getProperty("text").toString();
+                    if (text == "producer-A")
+                        sawA = true;
+                    if (text == "producer-B")
+                        sawB = true;
+                }
+            }
+            check(!sawA, "producer A enqueued before clear must be absent");
+            check(sawB, "producer B enqueued after clear must be present");
+
+            finishConsole();
+            break;
+        }
+        default:
+            finishConsole();
+            break;
+        }
+    }
+
+    void finishConsole()
+    {
+        if (consoleFinished)
+            return;
+        consoleFinished = true;
+        stopTimer();
+
+        editor->pd->lockAudioThread();
+        if (replyReceiver)
+            pd_free(static_cast<t_pd*>(replyReceiver));
+        replyReceiver = nullptr;
+        editor->pd->unlockAudioThread();
 
         signalDone(allPassed);
     }
@@ -558,4 +1006,13 @@ private:
     int lifetimeStage = 0;
     bool allPassed = true;
     bool finished = false;
+
+    int consoleStep = -1;
+    bool consoleFinished = false;
+    Console::ConsoleComponent* consoleComponent = nullptr;
+    std::thread producerThreadA;
+    std::thread producerThreadB;
+    WaitableEvent producerAEnqueued;
+    WaitableEvent allowProducerB;
+    WaitableEvent producerBEnqueued;
 };

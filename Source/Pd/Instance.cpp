@@ -81,6 +81,45 @@ var makeDebugInvocationSuccess(int const requestId)
     return var(response);
 }
 
+String consoleSeverityToString(int const severity)
+{
+    switch (severity) {
+    case 1:
+        return "warning";
+    case 2:
+        return "error";
+    default:
+        return "message";
+    }
+}
+
+var makeConsoleSnapshot(int const requestId, Array<var> const& entries, bool const truncated)
+{
+    auto* data = new DynamicObject();
+    data->setProperty("entries", var(entries));
+    data->setProperty("truncated", truncated);
+
+    auto* response = new DynamicObject();
+    response->setProperty("version", debugProtocolVersion);
+    response->setProperty("request_id", requestId);
+    response->setProperty("ok", true);
+    response->setProperty("data", var(data));
+    return var(response);
+}
+
+var makeClearSuccess(int const requestId)
+{
+    auto* data = new DynamicObject();
+    data->setProperty("status", "cleared");
+
+    auto* response = new DynamicObject();
+    response->setProperty("version", debugProtocolVersion);
+    response->setProperty("request_id", requestId);
+    response->setProperty("ok", true);
+    response->setProperty("data", var(data));
+    return var(response);
+}
+
 bool hasOnlySetGenerationFields(DynamicObject const& request)
 {
     auto const& properties = request.getProperties();
@@ -108,6 +147,37 @@ bool hasOnlySendObjectFields(DynamicObject const& request)
         if (propertyName != "version" && propertyName != "request_id" && propertyName != "operation"
             && propertyName != "generation" && propertyName != "canvas_path" && propertyName != "object_ordinal"
             && propertyName != "selector" && propertyName != "atoms")
+            return false;
+    }
+    return true;
+}
+
+bool hasOnlyGetConsoleFields(DynamicObject const& request)
+{
+    auto const& properties = request.getProperties();
+    if (properties.size() != 5)
+        return false;
+
+    for (auto const& [name, value] : properties) {
+        ignoreUnused(value);
+        auto const propertyName = name.toString();
+        if (propertyName != "version" && propertyName != "request_id" && propertyName != "operation"
+            && propertyName != "include_history" && propertyName != "max_entries")
+            return false;
+    }
+    return true;
+}
+
+bool hasOnlyClearConsoleFields(DynamicObject const& request)
+{
+    auto const& properties = request.getProperties();
+    if (properties.size() != 3)
+        return false;
+
+    for (auto const& [name, value] : properties) {
+        ignoreUnused(value);
+        auto const propertyName = name.toString();
+        if (propertyName != "version" && propertyName != "request_id" && propertyName != "operation")
             return false;
     }
     return true;
@@ -409,11 +479,11 @@ public:
         startTimerHz(30);
     }
 
-    void addMessage(void* object, String const& message, bool type)
+    void addMessage(void* object, String const& message, int type)
     {
         if (consoleMessages.size()) {
             auto& [lastObject, lastMessage, lastType, lastLength, numMessages] = consoleMessages.back();
-            if (object == lastObject && message == lastMessage && static_cast<int>(type) == lastType) {
+            if (object == lastObject && message == lastMessage && type == lastType) {
                 numMessages++;
             } else {
                 consoleMessages.emplace_back(object, message, type, CachedStringWidth<14>::calculateStringWidth(message) + 40, 1);
@@ -428,17 +498,23 @@ public:
 
     void logMessage(void* object, SmallString const& message)
     {
-        pendingMessages.enqueue({ object, message, false });
+        pendingLock.enter();
+        pendingMessages.emplace_back(object, message, 0);
+        pendingLock.exit();
     }
 
     void logWarning(void* object, SmallString const& warning)
     {
-        pendingMessages.enqueue({ object, warning, true });
+        pendingLock.enter();
+        pendingMessages.emplace_back(object, warning, 1);
+        pendingLock.exit();
     }
 
     void logError(void* object, SmallString const& error)
     {
-        pendingMessages.enqueue({ object, error, true });
+        pendingLock.enter();
+        pendingMessages.emplace_back(object, error, 2);
+        pendingLock.exit();
     }
 
     void processPrint(void* object, char const* message)
@@ -490,34 +566,55 @@ public:
     std::deque<std::tuple<void*, String, int, int, int>> consoleMessages;
     std::deque<std::tuple<void*, String, int, int, int>> consoleHistory;
 
+    struct DrainSummary {
+        int numReceived = 0;
+        bool anyWarning = false;
+        bool lastWasWarning = false;
+        SmallString lastMessage;
+    };
+
+    // Moves every pending entry into the visible buffer under the console mutex,
+    // returning the summary the GUI notification path needs.
+    DrainSummary drainPendingUnderLock()
+    {
+        DrainSummary summary;
+        pendingLock.enter();
+        while (!pendingMessages.empty()) {
+            auto& [object, message, type] = pendingMessages.front();
+            addMessage(object, message.toString(), type);
+            pendingMessages.pop_front();
+
+            summary.numReceived++;
+            summary.anyWarning = summary.anyWarning || (type != 0);
+            summary.lastMessage = message;
+            summary.lastWasWarning = (type != 0);
+        }
+        pendingLock.exit();
+        return summary;
+    }
+
+    // Discards every pending entry under the console mutex. This is the
+    // clear_console linearization point.
+    void discardPendingUnderLock()
+    {
+        pendingLock.enter();
+        pendingMessages.clear();
+        pendingLock.exit();
+    }
+
 private:
     void timerCallback() override
     {
-        auto item = std::tuple<void*, SmallString, bool>();
-        int numReceived = 0;
-        bool newWarning = false;
-        SmallString lastMessage;
-        bool lastIsWarning = false;
-
-        while (pendingMessages.try_dequeue(item)) {
-            auto& [object, message, type] = item;
-            addMessage(object, message.toString(), type);
-
-            numReceived++;
-            newWarning = newWarning || type;
-            lastMessage = message;
-            lastIsWarning = type;
-        }
-
-        // Check if any item got assigned
-        if (numReceived) {
-            instance->updateConsole(lastMessage, lastIsWarning, numReceived, newWarning);
+        auto const summary = drainPendingUnderLock();
+        if (summary.numReceived) {
+            instance->updateConsole(summary.lastMessage, summary.lastWasWarning, summary.numReceived, summary.anyWarning);
         }
     }
 
     StackArray<char, 2048> printConcatBuffer = { };
 
-    moodycamel::ConcurrentQueue<std::tuple<void*, SmallString, bool>> pendingMessages = moodycamel::ConcurrentQueue<std::tuple<void*, SmallString, bool>>(512);
+    CriticalSection pendingLock;
+    std::deque<std::tuple<void*, SmallString, int>> pendingMessages;
     int messageLength = 0;
 };
 
@@ -1514,7 +1611,9 @@ void Instance::handleDebugMessage(Message const& message)
     }
 
     auto const operation = request->getProperty("operation");
-    if (!operation.isString() || (operation.toString() != "set_generation" && operation.toString() != "send_object")) {
+    if (!operation.isString()
+        || (operation.toString() != "set_generation" && operation.toString() != "send_object"
+            && operation.toString() != "get_console" && operation.toString() != "clear_console")) {
         reply(makeDebugError(requestId, "UnknownOperation", "Unknown debug operation"), requestId);
         return;
     }
@@ -1648,6 +1747,79 @@ void Instance::handleDebugMessage(Message const& message)
         } else {
             reply(makeDebugInvocationSuccess(requestId), requestId);
         }
+        return;
+    }
+
+    if (operation.toString() == "get_console") {
+        if (!hasOnlyGetConsoleFields(*request)) {
+            reply(makeDebugError(requestId, "InvalidRequest", "get_console contains unknown or missing fields"), requestId);
+            return;
+        }
+
+        auto const includeHistoryValue = request->getProperty("include_history");
+        auto const maxEntriesValue = request->getProperty("max_entries");
+        if (!includeHistoryValue.isBool()
+            || !(maxEntriesValue.isInt() || maxEntriesValue.isInt64())
+            || static_cast<int64>(maxEntriesValue) < 1 || static_cast<int64>(maxEntriesValue) > 200) {
+            reply(makeDebugError(requestId, "InvalidRequest", "include_history must be boolean and max_entries must be an integer from 1 through 200"), requestId);
+            return;
+        }
+
+        bool const includeHistory = static_cast<bool>(includeHistoryValue);
+        int const maxEntries = static_cast<int>(static_cast<int64>(maxEntriesValue));
+
+        consoleMessageHandler->drainPendingUnderLock();
+
+        auto const& history = consoleMessageHandler->consoleHistory;
+        auto const& visible = consoleMessageHandler->consoleMessages;
+        int const historySize = static_cast<int>(history.size());
+        int const visibleSize = static_cast<int>(visible.size());
+        int const total = includeHistory ? historySize + visibleSize : visibleSize;
+        int const emitCount = jmin(maxEntries, total);
+        int const startIndex = total - emitCount;
+
+        Array<var> entries;
+        bool truncated = false;
+
+        for (int i = startIndex; i < total; ++i) {
+            bool const fromHistory = includeHistory && i < historySize;
+            int const index = fromHistory ? i : i - (includeHistory ? historySize : 0);
+            auto const& entry = fromHistory ? history[static_cast<size_t>(index)] : visible[static_cast<size_t>(index)];
+
+            auto* entryObject = new DynamicObject();
+            entryObject->setProperty("text", std::get<1>(entry));
+            entryObject->setProperty("severity", consoleSeverityToString(std::get<2>(entry)));
+            entryObject->setProperty("repeats", std::get<4>(entry));
+            entryObject->setProperty("source", fromHistory ? "history" : "visible");
+
+            entries.add(var(entryObject));
+
+            if (Base64::toBase64(JSON::toString(makeConsoleSnapshot(requestId, entries, false), true)).getNumBytesAsUTF8()
+                > maxEncodedDebugResponseBytes) {
+                entries.removeLast(1);
+                truncated = true;
+                break;
+            }
+        }
+
+        reply(makeConsoleSnapshot(requestId, entries, truncated), requestId);
+        return;
+    }
+
+    if (operation.toString() == "clear_console") {
+        if (!hasOnlyClearConsoleFields(*request)) {
+            reply(makeDebugError(requestId, "InvalidRequest", "clear_console contains unknown or missing fields"), requestId);
+            return;
+        }
+
+        consoleMessageHandler->discardPendingUnderLock();
+
+        consoleMessageHandler->consoleMessages.clear();
+        consoleMessageHandler->consoleHistory.clear();
+
+        updateConsole(SmallString(), false, 0, false);
+
+        reply(makeClearSuccess(requestId), requestId);
         return;
     }
 

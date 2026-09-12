@@ -274,7 +274,7 @@ public:
                 auto& [object, message, type, length, repeats] = console.pd->getConsoleMessages()[idx];
 
                 // Check if message type should be visible
-                if ((type == 0 && !showMessages) || (type == 1 && !showErrors)) {
+                if ((type == 0 && !showMessages) || ((type == 1 || type == 2) && !showErrors)) {
                     return;
                 }
 

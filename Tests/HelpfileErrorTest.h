@@ -59,7 +59,7 @@ private:
         StringArray errors;
         for(auto& [ptr, message, type, length, repeats] : pd->getConsoleMessages())
         {
-            if(type == 1) errors.add(message);
+            if(type != 0) errors.add(message);
         }
 
         if(!errors.isEmpty())
