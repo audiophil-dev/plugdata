@@ -304,6 +304,62 @@ private:
         sendRequest(makeSendObjectRequest(61, generation, {}, 0, "", noAtoms), 61, false, "InvalidSelector");
         sendRequest(makeSendObjectRequest(62, generation, {}, 1, "bang", noAtoms), 62, false, "ObjectTypeMismatch");
 
+        // Boundary tests below dispatch to a dedicated 32-deep fixture's
+        // "deep-target" print object rather than the root's "direct-root"
+        // print object, so their output never pollutes the exact
+        // direct-root/direct-nested print-line assertion made earlier for
+        // requests 40-51.
+        auto* deepCanvas = editor->getTabComponent().openPatch(makeDeepNestedPatch(32));
+        check(deepCanvas != nullptr, "the 32-deep nested fixture canvas must open");
+        if (deepCanvas) {
+            deepCanvas->performSynchronise();
+            auto* deepRoot = deepCanvas->patch.getRawPointer();
+            editor->pd->lockAudioThread();
+            pd_bind(&deepRoot->gl_obj.ob_pd, editor->pd->generateSymbol("deep-root"));
+            editor->pd->unlockAudioThread();
+
+            sendRequest(makeSetGenerationRequest(200, "generation-deep", "deep-root"), 200, true, {});
+
+            // Canvas_path depth exactly 32 succeeds against the real 32-deep
+            // fixture; 33 is rejected purely by the static request-shape
+            // bound, so no fixture that deep is required for that case.
+            Array<int> path32;
+            for (int i = 0; i < 32; ++i)
+                path32.add(0);
+            sendRequest(makeSendObjectRequest(201, "generation-deep", path32, 0, "bang", noAtoms), 201, true, {});
+            expectedReplies.back().successStatus = "invoked";
+
+            // Selector length exactly 1024 UTF-8 bytes succeeds; 1025 is rejected.
+            sendRequest(makeSendObjectRequest(204, "generation-deep", path32, 0, String::repeatedString("s", 1024), noAtoms), 204, true, {});
+            expectedReplies.back().successStatus = "invoked";
+            sendRequest(makeSendObjectRequest(205, "generation-deep", path32, 0, String::repeatedString("s", 1025), noAtoms), 205, false, "InvalidSelector");
+
+            // Atom count exactly 256 succeeds via "list"; 257 is rejected.
+            Array<var> atoms256;
+            for (int i = 0; i < 256; ++i)
+                atoms256.add(0.0);
+            sendRequest(makeSendObjectRequest(206, "generation-deep", path32, 0, "list", atoms256), 206, true, {});
+            expectedReplies.back().successStatus = "invoked";
+            Array<var> atoms257 = atoms256;
+            atoms257.add(0.0);
+            sendRequest(makeSendObjectRequest(207, "generation-deep", path32, 0, "list", atoms257), 207, false, "InvalidRequest");
+
+            // String atom exactly 2048 UTF-8 bytes succeeds; 2049 is rejected.
+            Array<var> stringAtom2048 { String::repeatedString("a", 2048) };
+            sendRequest(makeSendObjectRequest(208, "generation-deep", path32, 0, "custom", stringAtom2048), 208, true, {});
+            expectedReplies.back().successStatus = "invoked";
+            Array<var> stringAtom2049 { String::repeatedString("a", 2049) };
+            sendRequest(makeSendObjectRequest(209, "generation-deep", path32, 0, "custom", stringAtom2049), 209, false, "InvalidAtoms");
+
+            Array<int> path33 = path32;
+            path33.add(0);
+            sendRequest(makeSendObjectRequest(202, "generation-deep", path33, 0, "bang", noAtoms), 202, false, "InvalidRequest");
+
+            sendRequest(makeSetGenerationRequest(203, "generation-1", rootReceiver), 203, true, {});
+            expectedReplies.back().generationProbe = "generation-1";
+            expectedReplies.back().generationActive = true;
+        }
+
         editor->pd->lockAudioThread();
         expectedReplies.push_back({ 0, false, "InvalidEnvelope" });
         editor->pd->sendBang("__pd_mcp_debug");
@@ -514,6 +570,20 @@ private:
     static String makeFixturePatch()
     {
         return "#N canvas 100 100 300 200 12;\n#X obj 20 20 print direct-root;\n#X text 20 50 comment;\n#N canvas 0 0 300 200 nested 0;\n#X obj 20 20 print direct-nested;\n#X restore 100 100 pd nested;\n";
+    }
+
+    // Builds a patch with `depth` levels of nesting, each the ordinal-0 child
+    // of its parent, so canvas_path = 32 zeros reaches a real target for the
+    // canvas-depth boundary test.
+    static String makeDeepNestedPatch(int const depth)
+    {
+        String patch = "#N canvas 100 100 300 200 12;\n";
+        for (int i = 1; i <= depth; ++i)
+            patch += "#N canvas 0 0 300 200 deep" + String(i) + " 0;\n";
+        patch += "#X obj 20 20 print deep-target;\n";
+        for (int i = depth; i >= 1; --i)
+            patch += "#X restore 100 100 pd deep" + String(i) + ";\n";
+        return patch;
     }
 
     void deleteRootAndProbe()
