@@ -562,6 +562,8 @@ private:
             rebuildRootAndProbeStaleGeneration();
         } else if (lifetimeStage == 3) {
             reregisterRootAndProbe();
+        } else if (lifetimeStage == 4) {
+            advanceLifetimeCycle();
         } else {
             finishProtocol();
         }
@@ -626,15 +628,30 @@ private:
     void reregisterRootAndProbe()
     {
         lifetimeStage = 4;
-        sendRequest(makeSetGenerationRequest(72, "generation-2", rootReceiver), 72, true, {});
+        String const freshGeneration = "generation-cycle-" + String(lifetimeCycle + 2);
+        sendRequest(makeSetGenerationRequest(72, freshGeneration, rootReceiver), 72, true, {});
         sendRequest(makeSendObjectRequest(73, lifetimeGeneration, {}, 0, "bang", {}), 73, false, "StaleGeneration");
         printBuffer.clear();
         printLines.clear();
         expectedPrintLines.clear();
-        sendRequest(makeSendObjectRequest(74, "generation-2", {}, 0, "bang", {}), 74, true, {});
+        sendRequest(makeSendObjectRequest(74, freshGeneration, {}, 0, "bang", {}), 74, true, {});
         expectedReplies.back().successStatus = "invoked";
         expectedPrintLines.add("direct-root: bang");
+        lifetimeGeneration = freshGeneration;
         startTimer(5000);
+    }
+
+    // Repeats delete->probe->rebuild->probe->reregister for lifetimeCycleCount
+    // cycles total, proving no cumulative leak or stale access across
+    // repeated root destruction/recreation rather than a single pass.
+    void advanceLifetimeCycle()
+    {
+        ++lifetimeCycle;
+        if (lifetimeCycle < lifetimeCycleCount) {
+            deleteRootAndProbe();
+        } else {
+            finishProtocol();
+        }
     }
 
     void finishProtocol()
@@ -1074,6 +1091,8 @@ private:
     Array<String> expectedPrintLines;
     int receivedLifecycleMessages = 0;
     int lifetimeStage = 0;
+    int lifetimeCycle = 0;
+    static constexpr int lifetimeCycleCount = 5;
     bool allPassed = true;
     bool finished = false;
 
