@@ -425,7 +425,7 @@ public:
                 auto const numLines = Console::calculateNumLines(message, totalLength, getWidth());
                 auto height = numLines * 13 + 12;
 
-                if ((type == 0 && !showMessages) || (type == 1 && !showErrors))
+                if ((type == 0 && !showMessages) || ((type == 1 || type == 2) && !showErrors))
                     continue;
 
                 totalHeight += std::max(0, height);
@@ -474,7 +474,7 @@ public:
                 auto const numLines = Console::calculateNumLines(message, totalLength, getWidth());
                 auto const height = numLines * 13 + 12;
 
-                if ((type == 0 && !showMessages) || (type == 1 && !showErrors))
+                if ((type == 0 && !showMessages) || ((type == 1 || type == 2) && !showErrors))
                     continue;
 
                 int const rightMargin = viewport.canScrollVertically() ? 13 : 11;
