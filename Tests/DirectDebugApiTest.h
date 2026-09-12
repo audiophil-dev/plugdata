@@ -1,5 +1,6 @@
 #include "Pd/Setup.h"
 #include "Sidebar/Console.h"
+#include <atomic>
 #include <thread>
 
 class DirectDebugApiTest : public PlugDataUnitTest, private Timer
@@ -1046,6 +1047,28 @@ private:
             check(!sawA, "producer A enqueued before clear must be absent");
             check(sawB, "producer B enqueued after clear must be present");
 
+            runPrintUnderLockConcurrencyProof();
+            break;
+        }
+        case 18: {
+            checkConsoleReply(0, 200, true, "");
+            for (int i = 0; i < 5; ++i)
+                checkConsoleReply(i + 1, 123 + i, true, "");
+
+            stopConcurrentProducers.store(true);
+            for (auto& producer : concurrentProducers)
+                producer.join();
+            concurrentProducers.clear();
+
+            if (concurrencyCanvas) {
+                editor->pd->lockAudioThread();
+                if (auto* root = concurrencyCanvas->patch.getRawPointer())
+                    pd_unbind(&root->gl_obj.ob_pd, editor->pd->generateSymbol("concurrency-root"));
+                editor->pd->unlockAudioThread();
+                editor->getTabComponent().closeTab(concurrencyCanvas);
+                concurrencyCanvas = nullptr;
+            }
+
             finishConsole();
             break;
         }
@@ -1053,6 +1076,47 @@ private:
             finishConsole();
             break;
         }
+    }
+
+    // Proves the Task-3 pending-console mutex never needs to nest with the
+    // Pd lock under real contention: producer threads hammer logWarning()
+    // (pendingLock only) while the message thread concurrently dispatches
+    // send_object bangs to a real [print] target (Pd lock, via
+    // dispatchResolvedMessage). A genuine nesting bug would hang this step
+    // until the process-level test timeout instead of completing.
+    void runPrintUnderLockConcurrencyProof()
+    {
+        concurrencyCanvas = editor->getTabComponent().openPatch(
+            "#N canvas 100 100 300 200 12;\n#X obj 20 20 print concurrency-target;\n");
+        check(concurrencyCanvas != nullptr, "the concurrency fixture canvas must open");
+        if (!concurrencyCanvas) {
+            finishConsole();
+            return;
+        }
+        concurrencyCanvas->performSynchronise();
+        auto* root = concurrencyCanvas->patch.getRawPointer();
+        editor->pd->lockAudioThread();
+        pd_bind(&root->gl_obj.ob_pd, editor->pd->generateSymbol("concurrency-root"));
+        editor->pd->unlockAudioThread();
+
+        consoleBegin();
+        sendRequest(makeSetGenerationRequest(200, "generation-concurrency", "concurrency-root"), 200, true, {});
+
+        stopConcurrentProducers.store(false);
+        for (int i = 0; i < 3; ++i) {
+            concurrentProducers.emplace_back([this] {
+                while (!stopConcurrentProducers.load())
+                    editor->pd->logWarning("concurrent-noise");
+            });
+        }
+
+        for (int i = 0; i < 5; ++i) {
+            sendRequest(makeSendObjectRequest(123 + i, "generation-concurrency", {}, 0, "bang", Array<var>()), 123 + i, true, {});
+            expectedReplies.back().successStatus = "invoked";
+        }
+
+        consoleStep = 18;
+        startTimer(10000);
     }
 
     void finishConsole()
@@ -1104,4 +1168,7 @@ private:
     WaitableEvent producerAEnqueued;
     WaitableEvent allowProducerB;
     WaitableEvent producerBEnqueued;
+    Canvas* concurrencyCanvas = nullptr;
+    std::vector<std::thread> concurrentProducers;
+    std::atomic<bool> stopConcurrentProducers { false };
 };
