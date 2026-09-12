@@ -113,14 +113,6 @@ bool hasOnlySendObjectFields(DynamicObject const& request)
     return true;
 }
 
-bool isFiniteDebugNumber(var const& value)
-{
-    if (!value.isDouble() && !value.isInt() && !value.isInt64())
-        return false;
-
-    return std::isfinite(static_cast<float>(static_cast<double>(value)));
-}
-
 class StrictJsonValidator {
 public:
     struct Field {
@@ -1573,19 +1565,29 @@ void Instance::handleDebugMessage(Message const& message)
             return;
         }
 
+        Array<float> numericAtoms;
+        numericAtoms.ensureStorageAllocated(atoms->size());
         for (auto const& atom : *atoms) {
             if (atom.isString()) {
                 if (atom.toString().getNumBytesAsUTF8() > 2048) {
                     reply(makeDebugError(requestId, "InvalidAtoms", "String atoms must not exceed 2048 UTF-8 bytes"), requestId);
                     return;
                 }
-            } else if (!isFiniteDebugNumber(atom)) {
+                numericAtoms.add(0.0f);
+            } else if (!atom.isDouble() && !atom.isInt() && !atom.isInt64()) {
                 reply(makeDebugError(requestId, "InvalidAtoms", "Atoms must be finite numbers or strings"), requestId);
                 return;
+            } else {
+                auto const numericAtom = static_cast<float>(static_cast<double>(atom));
+                if (!std::isfinite(numericAtom)) {
+                    reply(makeDebugError(requestId, "InvalidAtoms", "Atoms must be finite numbers or strings"), requestId);
+                    return;
+                }
+                numericAtoms.add(numericAtom);
             }
         }
 
-        if ((selector == "float" && !isFiniteDebugNumber(atoms->getFirst()))
+        if ((selector == "float" && atoms->getFirst().isString())
             || (selector == "symbol" && !atoms->getFirst().isString())) {
             reply(makeDebugError(requestId, "InvalidAtoms", "Atoms must match the selector's required type"), requestId);
             return;
@@ -1629,8 +1631,10 @@ void Instance::handleDebugMessage(Message const& message)
                     else {
                         SmallArray<Atom> resolvedAtoms;
                         resolvedAtoms.reserve(atoms->size());
-                        for (auto const& atom : *atoms)
-                            resolvedAtoms.add(atom.isString() ? Atom(generateSymbol(atom.toString())) : Atom(static_cast<float>(atom)));
+                        for (int index = 0; index < atoms->size(); ++index) {
+                            auto const& atom = atoms->getReference(index);
+                            resolvedAtoms.add(atom.isString() ? Atom(generateSymbol(atom.toString())) : Atom(numericAtoms.getUnchecked(index)));
+                        }
                         dispatchResolvedMessage(&object->g_pd, SmallString(selector), resolvedAtoms);
                     }
                 }

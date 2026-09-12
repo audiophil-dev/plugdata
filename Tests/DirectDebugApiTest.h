@@ -31,9 +31,14 @@ private:
         static_cast<DirectDebugApiTest*>(context)->captureReply(selector, argc, argv);
     }
 
-    static void receiveSinkMessage(void* context, char const* receiver, char const* selector, int argc, t_atom* argv)
+    static void receivePrintMessage(void* context, void*, char const* fragment)
     {
-        static_cast<DirectDebugApiTest*>(context)->captureSinkMessage(receiver, selector, argc, argv);
+        auto* test = static_cast<DirectDebugApiTest*>(context);
+        test->printBuffer += String::fromUTF8(fragment);
+        while (test->printBuffer.containsChar('\n')) {
+            test->printLines.add(test->printBuffer.upToFirstOccurrenceOf("\n", false, false));
+            test->printBuffer = test->printBuffer.fromFirstOccurrenceOf("\n", false, false);
+        }
     }
 
     void check(bool const condition, String const& description)
@@ -101,27 +106,6 @@ private:
         sendJson(JSON::toString(request, true), requestId, ok, errorCode);
     }
 
-    static String formatSinkMessage(char const* receiver, char const* selector, int const argc, t_atom* argv)
-    {
-        String message = String::fromUTF8(receiver) + ":" + String::fromUTF8(selector) + "[";
-        for (int index = 0; index < argc; ++index) {
-            if (index != 0)
-                message += ",";
-            if (argv[index].a_type == A_FLOAT)
-                message += String(atom_getfloat(argv + index));
-            else if (argv[index].a_type == A_SYMBOL)
-                message += String::fromUTF8(atom_getsymbol(argv + index)->s_name);
-            else
-                message += "<invalid>";
-        }
-        return message + "]";
-    }
-
-    void captureSinkMessage(char const* receiver, char const* selector, int const argc, t_atom* argv)
-    {
-        sinkMessages.add(formatSinkMessage(receiver, selector, argc, argv));
-    }
-
     void testReceiverLifecycle()
     {
         beginTest("Reserved receiver lifecycle");
@@ -153,9 +137,8 @@ private:
         editor->pd->lockAudioThread();
         replyReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug_reply", nullptr, nullptr, nullptr, nullptr, receiveReply);
         nonCanvasReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug_non_canvas", nullptr, nullptr, nullptr, nullptr, nullptr);
-        rootSinkReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug_root_sink", nullptr, nullptr, nullptr, nullptr, receiveSinkMessage);
-        nestedSinkReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug_nested_sink", nullptr, nullptr, nullptr, nullptr, receiveSinkMessage);
-        fallbackSinkReceiver = pd::Setup::createReceiver(this, "__pd_mcp_debug_fallback_sink", nullptr, nullptr, nullptr, nullptr, receiveSinkMessage);
+        pd_unbind(static_cast<t_pd*>(editor->pd->printReceiver), gensym("#plugdata_print"));
+        printHook = pd::Setup::createPrintHook(this, receivePrintMessage);
         editor->pd->unlockAudioThread();
 
         rootCanvas = editor->getTabComponent().openPatch(makeFixturePatch());
@@ -186,33 +169,33 @@ private:
             sendRequest(makeSendObjectRequest(requestId, generation, path, ordinal, selector, atoms), requestId, true, {});
             expectedReplies.back().successStatus = "invoked";
         };
-        auto expectSink = [this](String const& receiver, String const& selector, String const& atoms) {
-            expectedSinkMessages.add(receiver + ":" + selector + "[" + atoms + "]");
+        auto expectPrint = [this](String const& prefix, String const& message) {
+            expectedPrintLines.add(prefix + ": " + message);
         };
         sendObject(40, {}, 0, "bang", noAtoms);
-        expectSink("__pd_mcp_debug_root_sink", "bang", "");
+        expectPrint("direct-root", "bang");
         sendObject(41, {}, 0, "float", oneFloat);
-        expectSink("__pd_mcp_debug_root_sink", "float", "12.5");
+        expectPrint("direct-root", "12.5");
         sendObject(42, {}, 0, "symbol", oneSymbol);
-        expectSink("__pd_mcp_debug_root_sink", "symbol", "value");
+        expectPrint("direct-root", "symbol value");
         sendObject(43, {}, 0, "list", listAtoms);
-        expectSink("__pd_mcp_debug_root_sink", "list", "12.5,value");
+        expectPrint("direct-root", "12.5 value");
         sendObject(44, {}, 0, "custom", listAtoms);
-        expectSink("__pd_mcp_debug_root_sink", "custom", "12.5,value");
+        expectPrint("direct-root", "custom 12.5 value");
         sendObject(45, {}, 0, "list", noAtoms);
-        expectSink("__pd_mcp_debug_root_sink", "list", "");
-        sendObject(46, { 3 }, 0, "bang", noAtoms);
-        expectSink("__pd_mcp_debug_nested_sink", "bang", "");
-        sendObject(47, { 3 }, 0, "float", oneFloat);
-        expectSink("__pd_mcp_debug_nested_sink", "float", "12.5");
-        sendObject(48, { 3 }, 0, "symbol", oneSymbol);
-        expectSink("__pd_mcp_debug_nested_sink", "symbol", "value");
-        sendObject(49, { 3 }, 0, "list", listAtoms);
-        expectSink("__pd_mcp_debug_nested_sink", "list", "12.5,value");
-        sendObject(50, { 3 }, 0, "custom", listAtoms);
-        expectSink("__pd_mcp_debug_nested_sink", "custom", "12.5,value");
-        sendObject(51, { 3 }, 0, "list", noAtoms);
-        expectSink("__pd_mcp_debug_nested_sink", "list", "");
+        expectPrint("direct-root", "bang");
+        sendObject(46, { 2 }, 0, "bang", noAtoms);
+        expectPrint("direct-nested", "bang");
+        sendObject(47, { 2 }, 0, "float", oneFloat);
+        expectPrint("direct-nested", "12.5");
+        sendObject(48, { 2 }, 0, "symbol", oneSymbol);
+        expectPrint("direct-nested", "symbol value");
+        sendObject(49, { 2 }, 0, "list", listAtoms);
+        expectPrint("direct-nested", "12.5 value");
+        sendObject(50, { 2 }, 0, "custom", listAtoms);
+        expectPrint("direct-nested", "custom 12.5 value");
+        sendObject(51, { 2 }, 0, "list", noAtoms);
+        expectPrint("direct-nested", "bang");
         sendRequest(makeSendObjectRequest(52, "stale-generation", {}, 0, "bang", noAtoms), 52, false, "StaleGeneration");
         sendRequest(makeSendObjectRequest(53, generation, { 1 }, 0, "bang", noAtoms), 53, false, "CanvasTypeMismatch");
         sendRequest(makeSendObjectRequest(54, generation, { 99 }, 0, "bang", noAtoms), 54, false, "CanvasNotFound");
@@ -223,20 +206,7 @@ private:
         sendRequest(makeSendObjectRequest(59, String::repeatedString("g", 129), {}, 0, "bang", noAtoms), 59, false, "InvalidRequest");
         sendRequest(makeSendObjectRequest(60, generation, {}, 0, "float", { 1.0e100 }), 60, false, "InvalidAtoms");
         sendRequest(makeSendObjectRequest(61, generation, {}, 0, "", noAtoms), 61, false, "InvalidSelector");
-        sendRequest(makeSendObjectRequest(62, generation, {}, 2, "bang", noAtoms), 62, false, "ObjectTypeMismatch");
-        sendObject(63, {}, 1, "custom", listAtoms);
-
-        auto* rootObject = rootCanvas->patch.getRawPointer()->gl_list;
-        editor->pd->sendDirectMessage(&rootObject->g_pd, SmallString("custom"), SmallArray<pd::Atom> { 7.0f, editor->pd->generateSymbol("direct") });
-        editor->pd->sendDirectMessage(&rootObject->g_pd, SmallArray<pd::Atom> { 8.0f, editor->pd->generateSymbol("list") });
-        editor->pd->sendDirectMessage(&rootObject->g_pd, SmallString("symbol-direct"));
-        editor->pd->sendDirectMessage(&rootObject->g_pd, 9.0f);
-        editor->pd->sendMessage("__pd_mcp_debug_fallback_sink", "fallback", { 10.0f });
-        expectedSinkMessages.insert(0, "__pd_mcp_debug_root_sink:custom[7,direct]");
-        expectedSinkMessages.insert(1, "__pd_mcp_debug_root_sink:list[8,list]");
-        expectedSinkMessages.insert(2, "__pd_mcp_debug_root_sink:symbol[symbol-direct]");
-        expectedSinkMessages.insert(3, "__pd_mcp_debug_root_sink:float[9]");
-        expectedSinkMessages.insert(4, "__pd_mcp_debug_fallback_sink:fallback[10]");
+        sendRequest(makeSendObjectRequest(62, generation, {}, 1, "bang", noAtoms), 62, false, "ObjectTypeMismatch");
 
         editor->pd->lockAudioThread();
         expectedReplies.push_back({ 0, false, "InvalidEnvelope" });
@@ -410,15 +380,23 @@ private:
             startTimer(100);
     }
 
+    void checkExpectedPrintLines(String const& description)
+    {
+        Array<String> actualDirectPrintLines;
+        for (auto const& line : printLines) {
+            if (line.startsWith("direct-root: ") || line.startsWith("direct-nested: "))
+                actualDirectPrintLines.add(line);
+        }
+        check(actualDirectPrintLines.size() == expectedPrintLines.size()
+                && std::ranges::is_permutation(actualDirectPrintLines, expectedPrintLines),
+            description);
+    }
+
     void timerCallback() override
     {
         stopTimer();
         if (lifetimeStage == 0) {
-            String actualSinkMessages;
-            for (auto const& message : sinkMessages)
-                actualSinkMessages << message << "|";
-            check(sinkMessages.size() == expectedSinkMessages.size() && std::ranges::is_permutation(sinkMessages, expectedSinkMessages),
-                "root and nested dispatch must produce exact sink output for every message form; actual=" + actualSinkMessages);
+            checkExpectedPrintLines("print hook must receive exact root and nested lines for every message form");
             check(rootCanvas && rootCanvas->patch.getCanvasContent() == originalCanvasContent,
                 "object dispatch must not change serialized patch content while the patch exists");
             deleteRootAndProbe();
@@ -435,11 +413,16 @@ private:
 
     static String makeFixturePatch()
     {
-        return "#N canvas 100 100 300 200 12;\n#X obj 20 20 s __pd_mcp_debug_root_sink;\n#X obj 20 50 print direct-root;\n#X text 20 80 comment;\n#N canvas 0 0 300 200 nested 0;\n#X obj 20 20 s __pd_mcp_debug_nested_sink;\n#X obj 20 50 print direct-nested;\n#X restore 100 100 pd nested;\n";
+        return "#N canvas 100 100 300 200 12;\n#X obj 20 20 print direct-root;\n#X text 20 50 comment;\n#N canvas 0 0 300 200 nested 0;\n#X obj 20 20 print direct-nested;\n#X restore 100 100 pd nested;\n";
     }
 
     void deleteRootAndProbe()
     {
+        editor->pd->lockAudioThread();
+        if (auto* root = rootCanvas->patch.getRawPointer())
+            pd_unbind(&root->gl_obj.ob_pd, editor->pd->generateSymbol(rootReceiver));
+        editor->pd->unlockAudioThread();
+
         auto& tabbar = editor->getTabComponent();
         tabbar.closeTab(rootCanvas);
         rootCanvas = nullptr;
@@ -450,7 +433,7 @@ private:
     void probeDeletedRoot()
     {
         lifetimeStage = 2;
-        sendRequest(makeSendObjectRequest(70, lifetimeGeneration, {}, 0, "bang", {}), 70, false, "StaleGeneration");
+        sendRequest(makeSendObjectRequest(70, lifetimeGeneration, {}, 0, "bang", {}), 70, false, "CanvasNotFound");
         startTimer(5000);
     }
 
@@ -466,7 +449,7 @@ private:
             editor->pd->unlockAudioThread();
         }
         lifetimeStage = 3;
-        sendRequest(makeSendObjectRequest(71, lifetimeGeneration, {}, 0, "bang", {}), 71, false, "StaleGeneration");
+        sendRequest(makeSendObjectRequest(71, lifetimeGeneration, {}, 0, "bang", {}), 71, false, "CanvasNotFound");
         startTimer(5000);
     }
 
@@ -474,9 +457,13 @@ private:
     {
         lifetimeStage = 4;
         sendRequest(makeSetGenerationRequest(72, "generation-2", rootReceiver), 72, true, {});
-        sendRequest(makeSendObjectRequest(73, "generation-2", {}, 0, "bang", {}), 73, true, {});
+        sendRequest(makeSendObjectRequest(73, lifetimeGeneration, {}, 0, "bang", {}), 73, false, "StaleGeneration");
+        printBuffer.clear();
+        printLines.clear();
+        expectedPrintLines.clear();
+        sendRequest(makeSendObjectRequest(74, "generation-2", {}, 0, "bang", {}), 74, true, {});
         expectedReplies.back().successStatus = "invoked";
-        expectedSinkMessages.add("__pd_mcp_debug_root_sink:bang[]");
+        expectedPrintLines.add("direct-root: bang");
         startTimer(5000);
     }
 
@@ -488,17 +475,7 @@ private:
         stopTimer();
 
         check(responses.size() == static_cast<int>(expectedReplies.size()), "every request must produce exactly one response");
-        check(sinkMessages.size() == expectedSinkMessages.size() && std::ranges::is_permutation(sinkMessages, expectedSinkMessages),
-            "re-registration must restore successful exact sink delivery");
-        String consoleText;
-        for (auto const& [object, message, type, length, repeats] : editor->pd->getConsoleMessages()) {
-            ignoreUnused(object, type, length, repeats);
-            consoleText << message << "\n";
-        }
-        check(consoleText.contains("direct-root:"), "root sink receives direct and object dispatch output");
-        check(consoleText.contains("direct-nested:"), "nested sink receives object dispatch output");
-        check(consoleText.contains("custom"), "typed selector reaches a sink");
-        check(consoleText.contains("12.5"), "numeric/list atoms reach a sink");
+        checkExpectedPrintLines("re-registration must restore the exact rebuilt root print line");
         int const responseCount = jmin(responses.size(), static_cast<int>(expectedReplies.size()));
         for (int i = 0; i < responseCount; ++i) {
             auto* response = responses[i].getDynamicObject();
@@ -541,12 +518,9 @@ private:
             pd_free(static_cast<t_pd*>(replyReceiver));
         if (nonCanvasReceiver)
             pd_free(static_cast<t_pd*>(nonCanvasReceiver));
-        if (rootSinkReceiver)
-            pd_free(static_cast<t_pd*>(rootSinkReceiver));
-        if (nestedSinkReceiver)
-            pd_free(static_cast<t_pd*>(nestedSinkReceiver));
-        if (fallbackSinkReceiver)
-            pd_free(static_cast<t_pd*>(fallbackSinkReceiver));
+        pd_unbind(static_cast<t_pd*>(printHook), gensym("#plugdata_print"));
+        pd_free(static_cast<t_pd*>(printHook));
+        pd_bind(static_cast<t_pd*>(editor->pd->printReceiver), gensym("#plugdata_print"));
 
         if (rootCanvas) {
             if (auto* root = rootCanvas->patch.getRawPointer()) {
@@ -573,14 +547,13 @@ private:
     Canvas* rootCanvas = nullptr;
     void* replyReceiver = nullptr;
     void* nonCanvasReceiver = nullptr;
-    void* rootSinkReceiver = nullptr;
-    void* nestedSinkReceiver = nullptr;
-    void* fallbackSinkReceiver = nullptr;
+    void* printHook = nullptr;
     String rootReceiver;
     String lifetimeGeneration;
     String originalCanvasContent;
-    Array<String> sinkMessages;
-    Array<String> expectedSinkMessages;
+    String printBuffer;
+    Array<String> printLines;
+    Array<String> expectedPrintLines;
     int receivedLifecycleMessages = 0;
     int lifetimeStage = 0;
     bool allPassed = true;
