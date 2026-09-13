@@ -83,6 +83,99 @@ You can use externals inside plugdata's plugin version by recompiling the extern
 -  Add your sources to the "externals" target inside Libraries/CMakeLists.txt. Alternatively the source files can be placed inside the Libraries/ELSE/Source folder, as all .c files in that folder will be compiled automatically.
 -  In Source/Pd/Setup.cpp, add the setup function for your external. The best place to call your setup function is inside libpd_init_pdlua. initialiseELSE and initialiseCyclone will also work, but it has the side-effect that the externals will also be available under the else/* and cyclone/* prefix.
 
+## Direct Debug API
+
+This fork adds an internal debug API for driving a live patch and reading the
+console from an external tool while plugdata is running. It is a receiver
+pair, not a network service: no socket, port, or authentication is added.
+
+### Receivers
+
+Requests are sent to a fixed Pd receiver and replies arrive on a fixed reply
+receiver, both bound once per `Instance`:
+
+```text
+__pd_mcp_debug request <base64-json>
+__pd_mcp_debug_reply response <base64-json>
+```
+
+The payload is JSON, base64-encoded, because raw JSON cannot cross Pd's FUDI
+message framing (commas, semicolons, newlines, and backslashes are message
+syntax in Pd). Every structurally readable request produces exactly one
+correlated reply with the same `request_id`; an unreadable payload replies
+with `request_id: 0`.
+
+### Envelope
+
+```json
+{"version": 1, "request_id": 1, "operation": "set_generation"}
+```
+
+```json
+{"version": 1, "request_id": 1, "ok": true, "data": {}}
+{"version": 1, "request_id": 1, "ok": false, "error": {"code": "InvalidRequest", "message": "..."}}
+```
+
+### Operations
+
+- `set_generation` binds an opaque `generation` token to a root canvas
+  identified by `root_receiver`. All later `send_object` calls must present
+  a matching, still-registered `generation`; there is no persisted raw
+  pointer identity, so a deleted or rebuilt root always invalidates the old
+  token.
+- `send_object` resolves `canvas_path` (a zero-based sequence of `gl_list`
+  ordinals from the registered root) plus `object_ordinal`, then sends
+  `bang`, `float`, `symbol`, `list`, or an arbitrary selector with atoms to
+  that object's normal left inlet. The reply's `status: "invoked"`
+  acknowledges only that the message was delivered - it makes no claim
+  about the object's resulting state or DSP output.
+- `get_console` returns the newest `max_entries` (1-200, default handling
+  documented in code) console entries, oldest to newest, each with its
+  text, `message`/`warning`/`error` severity, repeat count, and whether it
+  came from the visible buffer or (when `include_history` is set) history.
+  Entries never include origin pointers.
+- `clear_console` deterministically discards pending, visible, and
+  historical console state. This hard clear is a separate, non-reversible
+  operation from the sidebar's own "clear" button, which still just moves
+  visible entries into history for later restore.
+
+### Stable errors
+
+`InvalidEnvelope`, `UnsupportedProtocolVersion`, `PayloadTooLarge`,
+`InvalidRequest`, `UnknownOperation`, `StaleGeneration`, `CanvasNotFound`,
+`CanvasTypeMismatch`, `ObjectNotFound`, `ObjectTypeMismatch`,
+`InvalidSelector`, `InvalidAtoms`, `ResponseTooLarge`.
+
+### Limits
+
+Encoded request 64 KiB, decoded JSON 48 KiB, encoded response 60 KiB,
+generation/root-receiver tokens 128 UTF-8 bytes, canvas path depth 32,
+selector 1,024 UTF-8 bytes, atom count 256, string atom 2,048 UTF-8 bytes,
+console entries 1-200. Oversized console snapshots omit whole entries and
+set `truncated: true` rather than splitting a message.
+
+### Threading
+
+Requests are parsed and validated on the JUCE message thread before the Pd
+lock is taken; `send_object` resolves its path and dispatches in a single
+lock acquisition. Console pending-message enqueue, drain, and hard clear
+share one small mutex that is never held while acquiring the Pd lock.
+
+### Scope
+
+No new network listener is added by this fork. A separate, independently
+reviewed `pd-mcp` integration plan may later route external tool traffic
+through these receivers; that integration is out of scope here.
+
+### Licensing note for this fork
+
+This repository is a fork of plugdata with source-level modifications
+(this Direct Debug API among them). If you distribute a compiled binary
+built from this fork, the GPL-3.0 (and, via the bundled JUCE framework,
+AGPL-3.0) terms described above still apply: you must make the
+corresponding modified source available under the same license. This fork
+does not change plugdata's general licensing; see the section above.
+
 ## Corporate sponsors
 <p align="center" style="display: flex; flex-direction: column; align-items: center; justify-content: center;">
   <a href="https://gigperformer.com/">
