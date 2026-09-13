@@ -129,8 +129,9 @@ with `request_id: 0`.
   that object's normal left inlet. The reply's `status: "invoked"`
   acknowledges only that the message was delivered - it makes no claim
   about the object's resulting state or DSP output.
-- `get_console` returns the newest `max_entries` (1-200, default handling
-  documented in code) console entries, oldest to newest, each with its
+- `get_console` returns the newest `max_entries` console entries (a
+  required integer field, 1-200; missing or out-of-range values reply
+  `InvalidRequest`), oldest to newest, each with its
   text, `message`/`warning`/`error` severity, repeat count, and whether it
   came from the visible buffer or (when `include_history` is set) history.
   Entries never include origin pointers.
@@ -172,9 +173,9 @@ through these receivers; that integration is out of scope here.
 This repository is a fork of plugdata with source-level modifications
 (this Direct Debug API among them). If you distribute a compiled binary
 built from this fork, the GPL-3.0 (and, via the bundled JUCE framework,
-AGPL-3.0) terms described above still apply: you must make the
+AGPL-3.0) terms described below still apply: you must make the
 corresponding modified source available under the same license. This fork
-does not change plugdata's general licensing; see the section above.
+does not change plugdata's general licensing; see the section below.
 
 ## Corporate sponsors
 <p align="center" style="display: flex; flex-direction: column; align-items: center; justify-content: center;">
