@@ -310,7 +310,7 @@ private:
         // print object, so their output never pollutes the exact
         // direct-root/direct-nested print-line assertion made earlier for
         // requests 40-51.
-        auto* deepCanvas = editor->getTabComponent().openPatch(makeDeepNestedPatch(32));
+        deepCanvas = editor->getTabComponent().openPatch(makeDeepNestedPatch(32));
         check(deepCanvas != nullptr, "the 32-deep nested fixture canvas must open");
         if (deepCanvas) {
             deepCanvas->performSynchronise();
@@ -712,6 +712,11 @@ private:
         if (rootCanvas) {
             if (auto* root = rootCanvas->patch.getRawPointer()) {
                 pd_unbind(&root->gl_obj.ob_pd, editor->pd->generateSymbol(rootReceiver));
+            }
+        }
+        if (deepCanvas) {
+            if (auto* root = deepCanvas->patch.getRawPointer()) {
+                pd_unbind(&root->gl_obj.ob_pd, editor->pd->generateSymbol("deep-root"));
             }
         }
         editor->pd->unlockAudioThread();
@@ -1144,6 +1149,7 @@ private:
     std::vector<ExpectedReply> expectedReplies;
     Array<var> responses;
     Canvas* rootCanvas = nullptr;
+    Canvas* deepCanvas = nullptr;
     void* replyReceiver = nullptr;
     void* nonCanvasReceiver = nullptr;
     void* printHook = nullptr;
