@@ -1,6 +1,7 @@
 #include "Pd/Setup.h"
 #include "Sidebar/Console.h"
 #include <atomic>
+#include <iostream>
 #include <thread>
 
 class DirectDebugApiTest : public PlugDataUnitTest, private Timer
@@ -94,6 +95,26 @@ private:
         return var(request);
     }
 
+    static var makeGetConsoleRequest(int const requestId, bool const includeHistory, int const maxEntries, var const& sinceId)
+    {
+        auto request = makeGetConsoleRequest(requestId, includeHistory, maxEntries);
+        request.getDynamicObject()->setProperty("since_id", sinceId);
+        return request;
+    }
+
+    // Builds a get_console request on the raw JSON wire so malformed since_id
+    // values and missing mandatory fields can be exercised verbatim.
+    static String makeRawGetConsoleRequest(int const requestId, String const& includeHistoryJson, String const& maxEntriesField, String const& sinceIdField)
+    {
+        String json = "{\"version\":1,\"request_id\":" + String(requestId)
+            + ",\"operation\":\"get_console\",\"include_history\":" + includeHistoryJson;
+        if (maxEntriesField.isNotEmpty())
+            json += ",\"max_entries\":" + maxEntriesField;
+        if (sinceIdField.isNotEmpty())
+            json += ",\"since_id\":" + sinceIdField;
+        return json + "}";
+    }
+
     static var makeClearConsoleRequest(int const requestId)
     {
         auto* request = new DynamicObject();
@@ -107,6 +128,11 @@ private:
     {
         responses.clear();
         expectedReplies.clear();
+    }
+
+    void flushDebugQueue()
+    {
+        editor->pd->handleAsyncUpdate();
     }
 
     void consoleInject(String const& text, int const severity)
@@ -163,6 +189,48 @@ private:
         if (!data)
             return false;
         return static_cast<bool>(data->getProperty("truncated"));
+    }
+
+    static bool readConsoleCursor(var const& response, int64& cursor)
+    {
+        auto* obj = response.getDynamicObject();
+        if (!obj)
+            return false;
+        auto* data = obj->getProperty("data").getDynamicObject();
+        if (!data)
+            return false;
+        auto const value = data->getProperty("cursor");
+        if (!(value.isInt() || value.isInt64()))
+            return false;
+        cursor = static_cast<int64>(value);
+        return true;
+    }
+
+    bool consoleCursorAt(int const responseIndex, int64& cursor) const
+    {
+        if (responseIndex >= responses.size())
+            return false;
+        return readConsoleCursor(responses[responseIndex], cursor);
+    }
+
+    String consoleErrorMessage(int const responseIndex) const
+    {
+        if (responseIndex >= responses.size())
+            return {};
+        auto* response = responses[responseIndex].getDynamicObject();
+        if (!response)
+            return {};
+        auto* error = response->getProperty("error").getDynamicObject();
+        return error ? error->getProperty("message").toString() : String();
+    }
+
+    void checkConsoleErrorMessage(int const responseIndex, String const& expectedMessage)
+    {
+        check(responseIndex < responses.size(), "console error reply must be received");
+        if (responseIndex >= responses.size())
+            return;
+        check(consoleErrorMessage(responseIndex) == expectedMessage,
+            "console error message must match for response " + String(responseIndex));
     }
 
     void checkConsoleEntry(var const& entry, String const& text, String const& severity, int const repeats, String const& source, String const& description)
@@ -1211,6 +1279,171 @@ private:
             }
             checkConsoleIdsIncreasing(entries, "post-clear snapshot");
 
+            // Cursor section: start from a hard-cleared store with a known id run.
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(141), 141, true, {});
+            consoleStep = 24;
+            startTimer(5000);
+            break;
+        }
+        case 24: {
+            checkConsoleReply(0, 141, true, "");
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().empty(),
+                "cursor-section clear must empty both stores");
+
+            for (int i = 1; i <= 5; ++i)
+                consoleInject("cur-" + String(i), 0);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(142, false, 200), 142, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 142, true, "");
+            auto const* baseline = consoleEntries(0);
+            check(baseline != nullptr && baseline->size() == 5, "cursor baseline must return five entries");
+            cursorBaseIds.clear();
+            if (baseline)
+                for (auto const& entry : *baseline) {
+                    int64 id = 0;
+                    if (consoleEntryId(entry, id))
+                        cursorBaseIds.add(id);
+                }
+            bool const idsOk = cursorBaseIds.size() == 5;
+            check(idsOk, "cursor baseline must capture five ids");
+
+            int64 newest = idsOk ? cursorBaseIds[4] : 0;
+            int64 interior = idsOk ? cursorBaseIds[1] : 0;
+            int64 baselineCursor = 0;
+            bool const hasCursor = consoleCursorAt(0, baselineCursor);
+            check(hasCursor, "baseline snapshot must carry a cursor");
+            if (hasCursor && idsOk)
+                check(baselineCursor == newest, "cursor must equal the newest stored id");
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(143, false, 200, var(static_cast<int64>(0))), 143, true, {});
+            sendRequest(makeGetConsoleRequest(144, false, 200, var(newest)), 144, true, {});
+            sendRequest(makeGetConsoleRequest(145, false, 200, var(interior)), 145, true, {});
+            sendRequest(makeGetConsoleRequest(146, false, 200, var(newest + 100)), 146, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 143, true, "");
+            checkConsoleReply(1, 144, true, "");
+            checkConsoleReply(2, 145, true, "");
+            checkConsoleReply(3, 146, true, "");
+
+            auto const* all = consoleEntries(0);
+            check(all != nullptr && all->size() == 5, "since_id 0 must return all eligible entries");
+            if (all && all->size() == 5) {
+                checkConsoleEntry(all->getReference(0), "cur-1", "message", 1, "visible", "since_id 0 oldest entry");
+                if (idsOk)
+                    checkConsoleEntryId(all->getReference(0), cursorBaseIds[0], "since_id 0 first id");
+            }
+
+            auto const* emptyFromNewest = consoleEntries(1);
+            check(emptyFromNewest != nullptr && emptyFromNewest->isEmpty(), "since_id equal to the newest id must return no entries");
+
+            auto const* suffix = consoleEntries(2);
+            check(suffix != nullptr && suffix->size() == 3, "since_id one below an interior id must return the remaining suffix");
+            if (suffix && suffix->size() == 3) {
+                checkConsoleEntry(suffix->getReference(0), "cur-3", "message", 1, "visible", "filtered suffix oldest");
+                if (idsOk) {
+                    checkConsoleEntryId(suffix->getReference(0), cursorBaseIds[2], "filtered suffix first id");
+                    checkConsoleEntryId(suffix->getReference(2), cursorBaseIds[4], "filtered suffix newest id");
+                }
+            }
+            checkConsoleIdsIncreasing(suffix, "filtered since_id suffix");
+
+            auto const* emptyFromBeyond = consoleEntries(3);
+            check(emptyFromBeyond != nullptr && emptyFromBeyond->isEmpty(), "since_id beyond every stored id must return no entries");
+
+            int64 cursorAfterNewest = 0;
+            int64 cursorAfterBeyond = 0;
+            check(consoleCursorAt(1, cursorAfterNewest), "empty since_id reply must carry a cursor");
+            check(consoleCursorAt(3, cursorAfterBeyond), "beyond-newest since_id reply must carry a cursor");
+            if (idsOk)
+                check(cursorAfterNewest == newest && cursorAfterBeyond == newest, "cursor must equal the newest stored id for empty filters");
+
+            consoleBegin();
+            sendJson(makeRawGetConsoleRequest(150, "false", "200", "\"abc\""), 150, false, "InvalidRequest");
+            sendJson(makeRawGetConsoleRequest(151, "false", "200", "1.5"), 151, false, "InvalidRequest");
+            sendJson(makeRawGetConsoleRequest(152, "false", "200", "-1"), 152, false, "InvalidRequest");
+            sendJson(makeRawGetConsoleRequest(153, "false", "200", "true"), 153, false, "InvalidRequest");
+            sendJson(makeRawGetConsoleRequest(154, "false", "200", "null"), 154, false, "InvalidRequest");
+            sendJson(makeRawGetConsoleRequest(155, "false", "200", "{\"nested\":1}"), 155, false, "InvalidRequest");
+            sendJson(makeRawGetConsoleRequest(156, "false", "", "0"), 156, false, "InvalidRequest");
+            sendJson("{\"version\":1,\"request_id\":157,\"operation\":\"get_console\",\"include_history\":false,\"max_entries\":200,\"bogus\":1}", 157, false, "InvalidRequest");
+            flushDebugQueue();
+
+            for (int i = 0; i < 7; ++i)
+                checkConsoleReply(i, 150 + i, false, "InvalidRequest");
+            checkConsoleReply(7, 157, false, "InvalidRequest");
+            for (int i = 0; i < 6; ++i)
+                checkConsoleErrorMessage(i, "since_id must be a non-negative integer");
+            checkConsoleErrorMessage(6, "get_console contains unknown or missing fields");
+            checkConsoleErrorMessage(7, "get_console contains unknown or missing fields");
+
+            static String const malformedVariants[] = { "string", "fractional", "negative", "true", "null", "nested object" };
+            for (int i = 0; i < 6; ++i)
+                std::cout << "[malformed since_id] variant=" << malformedVariants[i]
+                          << " request_id=" << (150 + i)
+                          << " -> InvalidRequest message=\"" << consoleErrorMessage(i) << "\"" << std::endl;
+            std::cout << "[malformed since_id] variant=missing max_entries with since_id request_id=156"
+                      << " -> InvalidRequest message=\"" << consoleErrorMessage(6) << "\"" << std::endl;
+            std::cout << "[malformed since_id] variant=unknown extra field request_id=157"
+                      << " -> InvalidRequest message=\"" << consoleErrorMessage(7) << "\"" << std::endl;
+
+            // Malformed since_id must reject before the drain, so a pending row
+            // enqueued immediately before the request must still be pending.
+            static String const malformedValues[] = { "\"abc\"", "1.5", "-1", "true", "null", "{\"nested\":1}" };
+            static int const malformedIds[] = { 160, 161, 162, 163, 164, 165 };
+            for (int i = 0; i < 6; ++i) {
+                consoleInject("cursor-guard-" + String(i), 0);
+                int const before = editor->pd->getConsoleMessages().size();
+                consoleBegin();
+                sendJson(makeRawGetConsoleRequest(malformedIds[i], "false", "200", malformedValues[i]), malformedIds[i], false, "InvalidRequest");
+                flushDebugQueue();
+                check(editor->pd->getConsoleMessages().size() == before,
+                    "malformed since_id " + String(malformedValues[i]) + " must not drain pending console rows");
+                checkConsoleReply(0, malformedIds[i], false, "InvalidRequest");
+                checkConsoleErrorMessage(0, "since_id must be a non-negative integer");
+            }
+
+            consoleInject("cursor-guard-missing-max", 0);
+            int const beforeMissingMax = editor->pd->getConsoleMessages().size();
+            consoleBegin();
+            sendJson(makeRawGetConsoleRequest(166, "false", "", "0"), 166, false, "InvalidRequest");
+            flushDebugQueue();
+            check(editor->pd->getConsoleMessages().size() == beforeMissingMax,
+                "since_id with missing max_entries must not drain pending console rows");
+            checkConsoleReply(0, 166, false, "InvalidRequest");
+            checkConsoleErrorMessage(0, "get_console contains unknown or missing fields");
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(167), 167, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 167, true, "");
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().empty(),
+                "cursor-section cleanup clear must empty both stores");
+
+            int64 const retained = idsOk ? cursorBaseIds[4] : 0;
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(170, true, 200), 170, true, {});
+            sendRequest(makeGetConsoleRequest(171, true, 200, var(retained)), 171, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 170, true, "");
+            checkConsoleReply(1, 171, true, "");
+
+            auto const* cleared = consoleEntries(0);
+            check(cleared != nullptr && cleared->isEmpty(), "cleared store must return no entries");
+            int64 clearedCursor = 0;
+            check(consoleCursorAt(0, clearedCursor), "cleared snapshot must carry a cursor");
+            if (idsOk)
+                check(clearedCursor == retained, "cursor must retain the high-water id after hard clear");
+
+            auto const* emptiedBySince = consoleEntries(1);
+            check(emptiedBySince != nullptr && emptiedBySince->isEmpty(), "since_id at the retained cursor must return no entries");
+            int64 sinceCursor = 0;
+            check(consoleCursorAt(1, sinceCursor), "since_id-at-cursor reply must carry a cursor");
+            if (idsOk)
+                check(sinceCursor == retained, "cursor must stay at the retained high-water after hard clear");
+
             finishConsole();
             break;
         }
@@ -1317,4 +1550,5 @@ private:
     int64 firstRepeatOccurrenceId = 0;
     int64 lastIdBeforeHardClear = 0;
     Array<int64> guiClearIds;
+    Array<int64> cursorBaseIds;
 };

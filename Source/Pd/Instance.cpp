@@ -93,11 +93,12 @@ String consoleSeverityToString(int const severity)
     }
 }
 
-var makeConsoleSnapshot(int const requestId, Array<var> const& entries, bool const truncated)
+var makeConsoleSnapshot(int const requestId, Array<var> const& entries, bool const truncated, int64 const cursor)
 {
     auto* data = new DynamicObject();
     data->setProperty("entries", var(entries));
     data->setProperty("truncated", truncated);
+    data->setProperty("cursor", cursor);
 
     auto* response = new DynamicObject();
     response->setProperty("version", debugProtocolVersion);
@@ -155,17 +156,39 @@ bool hasOnlySendObjectFields(DynamicObject const& request)
 bool hasOnlyGetConsoleFields(DynamicObject const& request)
 {
     auto const& properties = request.getProperties();
-    if (properties.size() != 5)
+    if (properties.size() != 5 && properties.size() != 6)
         return false;
+
+    bool sawVersion = false;
+    bool sawRequestId = false;
+    bool sawOperation = false;
+    bool sawIncludeHistory = false;
+    bool sawMaxEntries = false;
+    bool sawSinceId = false;
 
     for (auto const& [name, value] : properties) {
         ignoreUnused(value);
         auto const propertyName = name.toString();
-        if (propertyName != "version" && propertyName != "request_id" && propertyName != "operation"
-            && propertyName != "include_history" && propertyName != "max_entries")
+        if (propertyName == "version")
+            sawVersion = true;
+        else if (propertyName == "request_id")
+            sawRequestId = true;
+        else if (propertyName == "operation")
+            sawOperation = true;
+        else if (propertyName == "include_history")
+            sawIncludeHistory = true;
+        else if (propertyName == "max_entries")
+            sawMaxEntries = true;
+        else if (propertyName == "since_id")
+            sawSinceId = true;
+        else
             return false;
     }
-    return true;
+
+    if (!(sawVersion && sawRequestId && sawOperation && sawIncludeHistory && sawMaxEntries))
+        return false;
+
+    return (properties.size() == 6) == sawSinceId;
 }
 
 bool hasOnlyClearConsoleFields(DynamicObject const& request)
@@ -1778,24 +1801,24 @@ void Instance::handleDebugMessage(Message const& message)
         bool const includeHistory = static_cast<bool>(includeHistoryValue);
         int const maxEntries = static_cast<int>(static_cast<int64>(maxEntriesValue));
 
+        auto const sinceIdValue = request->getProperty("since_id");
+        bool const hasSinceId = request->hasProperty("since_id");
+        if (hasSinceId && (!(sinceIdValue.isInt() || sinceIdValue.isInt64()) || static_cast<int64>(sinceIdValue) < 0)) {
+            reply(makeDebugError(requestId, "InvalidRequest", "since_id must be a non-negative integer"), requestId);
+            return;
+        }
+        int64 const sinceId = hasSinceId ? static_cast<int64>(sinceIdValue) : 0;
+
         consoleMessageHandler->drainPendingUnderLock();
+        int64 const cursor = consoleMessageHandler->lastStoredId;
 
         auto const& history = consoleMessageHandler->consoleHistory;
         auto const& visible = consoleMessageHandler->consoleMessages;
-        int const historySize = static_cast<int>(history.size());
-        int const visibleSize = static_cast<int>(visible.size());
-        int const total = includeHistory ? historySize + visibleSize : visibleSize;
-        int const emitCount = jmin(maxEntries, total);
-        int const startIndex = total - emitCount;
 
         Array<var> entries;
         bool truncated = false;
 
-        for (int i = startIndex; i < total; ++i) {
-            bool const fromHistory = includeHistory && i < historySize;
-            int const index = fromHistory ? i : i - (includeHistory ? historySize : 0);
-            auto const& entry = fromHistory ? history[static_cast<size_t>(index)] : visible[static_cast<size_t>(index)];
-
+        auto appendEntry = [&](auto const& entry, bool const fromHistory) {
             auto* entryObject = new DynamicObject();
             entryObject->setProperty("text", std::get<1>(entry));
             entryObject->setProperty("severity", consoleSeverityToString(std::get<2>(entry)));
@@ -1805,15 +1828,56 @@ void Instance::handleDebugMessage(Message const& message)
 
             entries.add(var(entryObject));
 
-            if (Base64::toBase64(JSON::toString(makeConsoleSnapshot(requestId, entries, false), true)).getNumBytesAsUTF8()
+            if (Base64::toBase64(JSON::toString(makeConsoleSnapshot(requestId, entries, false, cursor), true)).getNumBytesAsUTF8()
                 > maxEncodedDebugResponseBytes) {
                 entries.removeLast(1);
                 truncated = true;
-                break;
+                return false;
+            }
+            return true;
+        };
+
+        if (!hasSinceId) {
+            int const historySize = static_cast<int>(history.size());
+            int const visibleSize = static_cast<int>(visible.size());
+            int const total = includeHistory ? historySize + visibleSize : visibleSize;
+            int const emitCount = jmin(maxEntries, total);
+            int const startIndex = total - emitCount;
+
+            for (int i = startIndex; i < total; ++i) {
+                bool const fromHistory = includeHistory && i < historySize;
+                int const index = fromHistory ? i : i - (includeHistory ? historySize : 0);
+                auto const& entry = fromHistory ? history[static_cast<size_t>(index)] : visible[static_cast<size_t>(index)];
+                if (!appendEntry(entry, fromHistory))
+                    break;
+            }
+        } else {
+            int historyEligibleCount = 0;
+            Array<std::tuple<void*, String, int, int, int, int64_t> const*> eligible;
+            if (includeHistory)
+                for (auto const& entry : history)
+                    if (std::get<5>(entry) > sinceId) {
+                        eligible.add(&entry);
+                        ++historyEligibleCount;
+                    }
+
+            for (auto const& entry : visible)
+                if (std::get<5>(entry) > sinceId)
+                    eligible.add(&entry);
+
+            int const total = eligible.size();
+            int const emitCount = jmin(maxEntries, total);
+            int const startIndex = total - emitCount;
+
+            for (int i = startIndex; i < total; ++i) {
+                bool const fromHistory = i < historyEligibleCount;
+                auto const& entry = *eligible[i];
+                if (!appendEntry(entry, fromHistory))
+                    break;
             }
         }
 
-        reply(makeConsoleSnapshot(requestId, entries, truncated), requestId);
+        reply(makeConsoleSnapshot(requestId, entries, truncated, cursor), requestId);
         return;
     }
 
