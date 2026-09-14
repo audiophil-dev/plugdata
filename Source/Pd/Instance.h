@@ -287,8 +287,8 @@ public:
     void logError(String const& message);
     void logWarning(String const& message);
 
-    std::deque<std::tuple<void*, String, int, int, int>>& getConsoleMessages() const;
-    std::deque<std::tuple<void*, String, int, int, int>>& getConsoleHistory() const;
+    std::deque<std::tuple<void*, String, int, int, int, int64_t>>& getConsoleMessages() const;
+    std::deque<std::tuple<void*, String, int, int, int, int64_t>>& getConsoleHistory() const;
 
     void sendMessagesFromQueue();
     void processSend(dmessage const& mess);

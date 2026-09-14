@@ -57,7 +57,7 @@ private:
         }
 
         StringArray errors;
-        for(auto& [ptr, message, type, length, repeats] : pd->getConsoleMessages())
+        for(auto& [ptr, message, type, length, repeats, messageId] : pd->getConsoleMessages())
         {
             if(type != 0) errors.add(message);
         }

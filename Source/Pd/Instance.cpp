@@ -479,18 +479,21 @@ public:
         startTimerHz(30);
     }
 
-    void addMessage(void* object, String const& message, int type)
+    void addMessage(void* object, String const& message, int type, int64_t id)
     {
         if (consoleMessages.size()) {
-            auto& [lastObject, lastMessage, lastType, lastLength, numMessages] = consoleMessages.back();
+            auto& [lastObject, lastMessage, lastType, lastLength, numMessages, lastId] = consoleMessages.back();
             if (object == lastObject && message == lastMessage && type == lastType) {
                 numMessages++;
+                lastId = id;
             } else {
-                consoleMessages.emplace_back(object, message, type, CachedStringWidth<14>::calculateStringWidth(message) + 40, 1);
+                consoleMessages.emplace_back(object, message, type, CachedStringWidth<14>::calculateStringWidth(message) + 40, 1, id);
             }
         } else {
-            consoleMessages.emplace_back(object, message, type, CachedStringWidth<14>::calculateStringWidth(message) + 40, 1);
+            consoleMessages.emplace_back(object, message, type, CachedStringWidth<14>::calculateStringWidth(message) + 40, 1, id);
         }
+
+        lastStoredId = id;
 
         if (consoleMessages.size() > 800)
             consoleMessages.pop_front();
@@ -499,21 +502,21 @@ public:
     void logMessage(void* object, SmallString const& message)
     {
         pendingLock.enter();
-        pendingMessages.emplace_back(object, message, 0);
+        pendingMessages.emplace_back(object, message, 0, nextConsoleSequence++);
         pendingLock.exit();
     }
 
     void logWarning(void* object, SmallString const& warning)
     {
         pendingLock.enter();
-        pendingMessages.emplace_back(object, warning, 1);
+        pendingMessages.emplace_back(object, warning, 1, nextConsoleSequence++);
         pendingLock.exit();
     }
 
     void logError(void* object, SmallString const& error)
     {
         pendingLock.enter();
-        pendingMessages.emplace_back(object, error, 2);
+        pendingMessages.emplace_back(object, error, 2, nextConsoleSequence++);
         pendingLock.exit();
     }
 
@@ -563,8 +566,14 @@ public:
         }
     }
 
-    std::deque<std::tuple<void*, String, int, int, int>> consoleMessages;
-    std::deque<std::tuple<void*, String, int, int, int>> consoleHistory;
+    std::deque<std::tuple<void*, String, int, int, int, int64_t>> consoleMessages;
+    std::deque<std::tuple<void*, String, int, int, int, int64_t>> consoleHistory;
+
+    // Sequence ids are assigned exactly once at pending-enqueue under
+    // pendingLock and never reset on any clear path. lastStoredId is the
+    // high-water mark of ids that reached the stored rows.
+    int64 nextConsoleSequence = 1;
+    int64 lastStoredId = 0;
 
     struct DrainSummary {
         int numReceived = 0;
@@ -580,8 +589,8 @@ public:
         DrainSummary summary;
         pendingLock.enter();
         while (!pendingMessages.empty()) {
-            auto& [object, message, type] = pendingMessages.front();
-            addMessage(object, message.toString(), type);
+            auto& [object, message, type, id] = pendingMessages.front();
+            addMessage(object, message.toString(), type, id);
 
             summary.numReceived++;
             summary.anyWarning = summary.anyWarning || (type != 0);
@@ -615,7 +624,7 @@ private:
     StackArray<char, 2048> printConcatBuffer = { };
 
     CriticalSection pendingLock;
-    std::deque<std::tuple<void*, SmallString, int>> pendingMessages;
+    std::deque<std::tuple<void*, SmallString, int, int64_t>> pendingMessages;
     int messageLength = 0;
 };
 
@@ -1791,6 +1800,7 @@ void Instance::handleDebugMessage(Message const& message)
             entryObject->setProperty("text", std::get<1>(entry));
             entryObject->setProperty("severity", consoleSeverityToString(std::get<2>(entry)));
             entryObject->setProperty("repeats", std::get<4>(entry));
+            entryObject->setProperty("id", static_cast<int64>(std::get<5>(entry)));
             entryObject->setProperty("source", fromHistory ? "history" : "visible");
 
             entries.add(var(entryObject));
@@ -2136,12 +2146,12 @@ void Instance::logWarning(String const& warning)
     consoleMessageHandler->logWarning(nullptr, warning);
 }
 
-std::deque<std::tuple<void*, String, int, int, int>>& Instance::getConsoleMessages() const
+std::deque<std::tuple<void*, String, int, int, int, int64_t>>& Instance::getConsoleMessages() const
 {
     return consoleMessageHandler->consoleMessages;
 }
 
-std::deque<std::tuple<void*, String, int, int, int>>& Instance::getConsoleHistory() const
+std::deque<std::tuple<void*, String, int, int, int, int64_t>>& Instance::getConsoleHistory() const
 {
     return consoleMessageHandler->consoleHistory;
 }

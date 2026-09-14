@@ -209,7 +209,7 @@ public:
                     console.selectedItems.clear();
                 }
 
-                auto& [object, message, type, length, repeats] = console.pd->getConsoleMessages()[idx];
+                auto& [object, message, type, length, repeats, messageId] = console.pd->getConsoleMessages()[idx];
                 if (e.mods.isPopupMenu()) {
 
                     PopupMenu menu;
@@ -271,7 +271,7 @@ public:
                 }
 
                 // Get console message
-                auto& [object, message, type, length, repeats] = console.pd->getConsoleMessages()[idx];
+                auto& [object, message, type, length, repeats, messageId] = console.pd->getConsoleMessages()[idx];
 
                 // Check if message type should be visible
                 if ((type == 0 && !showMessages) || ((type == 1 || type == 2) && !showErrors)) {
@@ -420,7 +420,7 @@ public:
             auto const showErrors = getValue<bool>(settingsValues[3]);
             auto totalHeight = 0;
 
-            for (auto& [object, message, type, length, repeats] : pd->getConsoleMessages()) {
+            for (auto& [object, message, type, length, repeats, messageId] : pd->getConsoleMessages()) {
                 auto const totalLength = length + calculateRepeatOffset(repeats);
                 auto const numLines = Console::calculateNumLines(message, totalLength, getWidth());
                 auto height = numLines * 13 + 12;
@@ -468,7 +468,7 @@ public:
                 if (row >= messages.size())
                     break;
 
-                auto& [object, message, type, length, repeats] = pd->getConsoleMessages()[row];
+                auto& [object, message, type, length, repeats, messageId] = pd->getConsoleMessages()[row];
 
                 auto const totalLength = length + calculateRepeatOffset(repeats);
                 auto const numLines = Console::calculateNumLines(message, totalLength, getWidth());

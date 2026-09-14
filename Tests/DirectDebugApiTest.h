@@ -177,6 +177,45 @@ private:
         check(obj->getProperty("source").isString() && obj->getProperty("source").toString() == source, description + " source must match");
     }
 
+    static bool consoleEntryId(var const& entry, int64& id)
+    {
+        auto* obj = entry.getDynamicObject();
+        if (!obj)
+            return false;
+        auto const value = obj->getProperty("id");
+        if (!(value.isInt() || value.isInt64()))
+            return false;
+        id = static_cast<int64>(value);
+        return true;
+    }
+
+    void checkConsoleEntryId(var const& entry, int64 const expectedId, String const& description)
+    {
+        int64 actualId = 0;
+        check(consoleEntryId(entry, actualId), description + " must carry an id");
+        check(actualId == expectedId, description + " id must match");
+    }
+
+    void checkConsoleIdsIncreasing(Array<var> const* entries, String const& description)
+    {
+        if (entries == nullptr) {
+            check(false, description + " entries must be present");
+            return;
+        }
+
+        int64 previous = 0;
+        bool ok = true;
+        for (auto const& entry : *entries) {
+            int64 id = 0;
+            if (!consoleEntryId(entry, id) || id <= 0 || id <= previous) {
+                ok = false;
+                break;
+            }
+            previous = id;
+        }
+        check(ok, description + " ids must be present, positive, and strictly increasing");
+    }
+
     void sendWire(String const& selector, SmallArray<pd::Atom> const& atoms, int const requestId, bool const ok, String const& errorCode)
     {
         expectedReplies.push_back({ requestId, ok, errorCode });
@@ -791,6 +830,7 @@ private:
                 checkConsoleEntry(entries->getReference(2), "sev-error", "error", 1, "visible", "error entry");
             }
             check(!consoleTruncated(0), "severity snapshot must not be truncated");
+            checkConsoleIdsIncreasing(entries, "severity snapshot");
 
             consoleInject("dup", 1);
             consoleInject("dup", 1);
@@ -809,6 +849,7 @@ private:
                 checkConsoleEntry(entries->getReference(3), "dup", "warning", 2, "visible", "matching text+severity must collapse");
                 checkConsoleEntry(entries->getReference(4), "dup", "error", 1, "visible", "differing severity must not collapse");
             }
+            checkConsoleIdsIncreasing(entries, "repeat snapshot");
 
             consoleBegin();
             sendRequest(makeClearConsoleRequest(110), 110, true, {});
@@ -836,6 +877,7 @@ private:
                 checkConsoleEntry(entries->getReference(0), "cap-610", "message", 1, "visible", "newest suffix oldest entry");
                 checkConsoleEntry(entries->getReference(199), "cap-809", "message", 1, "visible", "newest suffix newest entry");
             }
+            checkConsoleIdsIncreasing(entries, "bounded 200-entry snapshot");
 
             consoleBegin();
             sendRequest(makeClearConsoleRequest(111), 111, true, {});
@@ -908,6 +950,15 @@ private:
                 checkConsoleEntry(entries->getReference(1), "hist-b", "warning", 1, "visible", "visible entry b");
                 checkConsoleEntry(entries->getReference(2), "hist-c", "error", 1, "visible", "visible entry c");
             }
+            checkConsoleIdsIncreasing(entries, "pre-GUI-clear visible snapshot");
+            guiClearIds.clear();
+            if (entries)
+                for (auto const& entry : *entries) {
+                    int64 id = 0;
+                    if (consoleEntryId(entry, id))
+                        guiClearIds.add(id);
+                }
+            check(guiClearIds.size() == 3, "GUI clear id capture must observe three ids");
 
             // Reversible GUI clear moves visible into history.
             if (consoleComponent)
@@ -935,7 +986,10 @@ private:
                 checkConsoleEntry(withHistory->getReference(0), "hist-a", "message", 1, "history", "history entry a");
                 checkConsoleEntry(withHistory->getReference(1), "hist-b", "warning", 1, "history", "history entry b");
                 checkConsoleEntry(withHistory->getReference(2), "hist-c", "error", 1, "history", "history entry c");
+                for (int i = 0; i < 3; ++i)
+                    checkConsoleEntryId(withHistory->getReference(i), guiClearIds[i], "GUI-cleared history entry " + String(i));
             }
+            checkConsoleIdsIncreasing(withHistory, "GUI-cleared history snapshot");
 
             // Reversible GUI restore moves history back into visible.
             if (consoleComponent)
@@ -953,8 +1007,12 @@ private:
             checkConsoleReply(0, 115, true, "");
             auto const* entries = consoleEntries(0);
             check(entries != nullptr && entries->size() == 3, "restored entries must be visible again");
-            if (entries && entries->size() == 3)
+            if (entries && entries->size() == 3) {
                 checkConsoleEntry(entries->getReference(2), "hist-c", "error", 1, "visible", "restored entry c");
+                for (int i = 0; i < 3; ++i)
+                    checkConsoleEntryId(entries->getReference(i), guiClearIds[i], "GUI-restored entry " + String(i));
+            }
+            checkConsoleIdsIncreasing(entries, "GUI-restored visible snapshot");
 
             consoleBegin();
             sendRequest(makeClearConsoleRequest(116), 116, true, {});
@@ -1074,6 +1132,85 @@ private:
                 concurrencyCanvas = nullptr;
             }
 
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(130), 130, true, {});
+            consoleStep = 19;
+            startTimer(5000);
+            break;
+        }
+        case 19: {
+            checkConsoleReply(0, 130, true, "");
+
+            consoleInject("id-dup", 1);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(131, false, 200), 131, true, {});
+            consoleStep = 20;
+            startTimer(5000);
+            break;
+        }
+        case 20: {
+            checkConsoleReply(0, 131, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 1, "first repeat occurrence must be the only entry");
+            if (entries && entries->size() == 1) {
+                int64 id = 0;
+                check(consoleEntryId(entries->getReference(0), id), "first repeat occurrence must carry an id");
+                firstRepeatOccurrenceId = id;
+            }
+
+            consoleInject("id-dup", 1);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(132, false, 200), 132, true, {});
+            consoleStep = 21;
+            startTimer(5000);
+            break;
+        }
+        case 21: {
+            checkConsoleReply(0, 132, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 1, "collapsed repeat must remain a single entry");
+            if (entries && entries->size() == 1) {
+                checkConsoleEntry(entries->getReference(0), "id-dup", "warning", 2, "visible", "repeat collapse with id adoption");
+                int64 id = 0;
+                check(consoleEntryId(entries->getReference(0), id), "collapsed repeat must carry an id");
+                check(id == firstRepeatOccurrenceId + 1, "collapsed repeat id must equal the second occurrence's id");
+                check(id > firstRepeatOccurrenceId, "collapsed repeat id must exceed the first occurrence's id");
+                lastIdBeforeHardClear = id;
+            }
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(133), 133, true, {});
+            consoleStep = 22;
+            startTimer(5000);
+            break;
+        }
+        case 22: {
+            checkConsoleReply(0, 133, true, "");
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().empty(),
+                "hard clear before id continuation must empty both stores");
+
+            consoleInject("post-clear-a", 0);
+            consoleInject("post-clear-b", 1);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(134, true, 200), 134, true, {});
+            consoleStep = 23;
+            startTimer(5000);
+            break;
+        }
+        case 23: {
+            checkConsoleReply(0, 134, true, "");
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 2, "post-clear snapshot must contain the two new entries");
+            if (entries && entries->size() == 2) {
+                int64 firstId = 0;
+                int64 secondId = 0;
+                consoleEntryId(entries->getReference(0), firstId);
+                consoleEntryId(entries->getReference(1), secondId);
+                check(firstId > lastIdBeforeHardClear, "post-clear ids must continue past pre-clear ids");
+                check(secondId > firstId, "post-clear ids must remain strictly increasing");
+            }
+            checkConsoleIdsIncreasing(entries, "post-clear snapshot");
+
             finishConsole();
             break;
         }
@@ -1177,4 +1314,7 @@ private:
     Canvas* concurrencyCanvas = nullptr;
     std::vector<std::thread> concurrentProducers;
     std::atomic<bool> stopConcurrentProducers { false };
+    int64 firstRepeatOccurrenceId = 0;
+    int64 lastIdBeforeHardClear = 0;
+    Array<int64> guiClearIds;
 };
