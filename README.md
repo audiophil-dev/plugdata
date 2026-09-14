@@ -132,9 +132,22 @@ with `request_id: 0`.
 - `get_console` returns the newest `max_entries` console entries (a
   required integer field, 1-200; missing or out-of-range values reply
   `InvalidRequest`), oldest to newest, each with its
-  text, `message`/`warning`/`error` severity, repeat count, and whether it
-  came from the visible buffer or (when `include_history` is set) history.
-  Entries never include origin pointers.
+  text, `message`/`warning`/`error` severity, repeat count, a stable
+  monotonic `id`, and whether it came from the visible buffer or (when
+  `include_history` is set) history. Entries never include origin pointers.
+  An optional `since_id` field (a non-negative integer; any other type or a
+  negative value replies `InvalidRequest`) selects only entries with
+  `id` greater than `since_id`, after which the newest-`max_entries` suffix
+  is applied to that filtered set. Every reply also carries a top-level
+  `cursor`: the `id` of the most recently stored entry (`0` before any
+  entry is stored), returned even when no entries match or both stores are
+  empty, and never reset by GUI clear, GUI restore, or `clear_console`.
+  Console storage is a bounded window: the visible buffer retains only its
+  newest 800 entries, `include_history` extends reach to the history
+  buffer, and `clear_console` discards both. Poll using the previous
+  reply's `cursor` as the next `since_id`; a poll interval slower than
+  eviction can leave entries that no longer match any reachable window
+  permanently unreachable.
 - `clear_console` deterministically discards pending, visible, and
   historical console state. This hard clear is a separate, non-reversible
   operation from the sidebar's own "clear" button, which still just moves
