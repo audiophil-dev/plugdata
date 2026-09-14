@@ -1444,6 +1444,483 @@ private:
             if (idsOk)
                 check(sinceCursor == retained, "cursor must stay at the retained high-water after hard clear");
 
+            consoleStep = 25;
+            startTimer(10);
+            break;
+        }
+        // (a) Incremental-drain proof: consecutive injected texts are pairwise
+        // distinct, so repeat collapse cannot merge any of them. Each round is
+        // drained with a since_id poll; the concatenation of the returned rows
+        // must reproduce every injected text exactly once, in id order, with no
+        // repeated ids and no missed rows, and the last cursor must equal the
+        // final delivered id.
+        case 25: {
+            String const drainTexts[] = {
+                "drain-1", "drain-2", "drain-3", "drain-4",
+                "drain-5", "drain-6", "drain-7", "drain-8",
+                "drain-9", "drain-10", "drain-11", "drain-12",
+            };
+            static constexpr int drainRounds = 3;
+            static constexpr int drainPerRound = 4;
+
+            Array<String> drainedTexts;
+            Array<int64> drainedIds;
+            int64 pollCursor = 0;
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(180, true, 200), 180, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 180, true, "");
+            auto const* baseline = consoleEntries(0);
+            check(baseline != nullptr && baseline->isEmpty(), "(a) incremental-drain baseline must be empty");
+            check(consoleCursorAt(0, pollCursor), "(a) baseline poll must carry a cursor");
+
+            bool roundsOk = true;
+            for (int round = 0; round < drainRounds && roundsOk; ++round) {
+                for (int i = 0; i < drainPerRound; ++i)
+                    consoleInject(drainTexts[round * drainPerRound + i], 0);
+
+                int const requestId = 181 + round;
+                consoleBegin();
+                sendRequest(makeGetConsoleRequest(requestId, false, 200, var(pollCursor)), requestId, true, {});
+                flushDebugQueue();
+                checkConsoleReply(0, requestId, true, "");
+
+                auto const* entries = consoleEntries(0);
+                if (entries == nullptr || entries->size() != drainPerRound) {
+                    roundsOk = false;
+                    check(false, "(a) each round poll must return exactly the injected rows");
+                    break;
+                }
+                checkConsoleIdsIncreasing(entries, "(a) round " + String(round) + " ids");
+                for (int i = 0; i < drainPerRound; ++i) {
+                    auto const expected = drainTexts[round * drainPerRound + i];
+                    checkConsoleEntry(entries->getReference(i), expected, "message", 1, "visible",
+                        "(a) round " + String(round) + " entry " + String(i));
+                    int64 id = 0;
+                    if (consoleEntryId(entries->getReference(i), id)) {
+                        drainedIds.add(id);
+                        drainedTexts.add(expected);
+                    }
+                }
+
+                int64 replyCursor = pollCursor;
+                check(consoleCursorAt(0, replyCursor), "(a) round poll must carry a cursor");
+                int64 lastRoundId = 0;
+                consoleEntryId(entries->getReference(drainPerRound - 1), lastRoundId);
+                check(replyCursor == lastRoundId, "(a) round cursor must equal the round's newest id");
+                if (replyCursor < pollCursor) {
+                    roundsOk = false;
+                    check(false, "(a) cursor must not move backwards");
+                    break;
+                }
+                pollCursor = replyCursor;
+            }
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(185, false, 200, var(pollCursor)), 185, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 185, true, "");
+            auto const* exhausted = consoleEntries(0);
+            check(exhausted != nullptr && exhausted->isEmpty(), "(a) polling from the final cursor must drain to empty");
+
+            check(drainedTexts.size() == drainRounds * drainPerRound, "(a) every injected text must be delivered exactly once");
+            check(drainedIds.size() == drainedTexts.size(), "(a) every delivered text must carry an id");
+            bool idsUnique = true;
+            for (int i = 1; i < drainedIds.size(); ++i)
+                if (drainedIds[i] <= drainedIds[i - 1]) {
+                    idsUnique = false;
+                    break;
+                }
+            check(idsUnique, "(a) delivered ids must be strictly increasing with no repeats");
+            if (drainedIds.size() > 0)
+                check(pollCursor == drainedIds[drainedIds.size() - 1], "(a) ending cursor must equal the final id");
+
+            std::cout << "[cursor-lifecycle] (a) incremental drain passed texts=" << drainedTexts.size() << std::endl;
+            consoleStep = 26;
+            startTimer(10);
+            break;
+        }
+        // (b) Repeat-update observability: a collapsed repeat advances the row's
+        // id, so a poll taken after the repeat must deliver the same row again
+        // under its newer id with repeats: 2, and a later poll must be empty.
+        case 26: {
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(190), 190, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 190, true, "");
+
+            int64 cursorBefore = 0;
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(191, true, 200), 191, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 191, true, "");
+            check(consoleCursorAt(0, cursorBefore), "(b) cleared poll must carry a cursor");
+
+            consoleInject("dup-observe", 1);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(192, false, 200, var(cursorBefore)), 192, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 192, true, "");
+            auto const* first = consoleEntries(0);
+            check(first != nullptr && first->size() == 1, "(b) first occurrence must be the only row");
+            int64 firstId = 0;
+            int64 afterFirst = 0;
+            if (first && first->size() == 1) {
+                checkConsoleEntry(first->getReference(0), "dup-observe", "warning", 1, "visible", "(b) first occurrence");
+                check(consoleEntryId(first->getReference(0), firstId), "(b) first occurrence must carry an id");
+            }
+            check(consoleCursorAt(0, afterFirst), "(b) first poll must carry a cursor");
+            check(afterFirst == firstId, "(b) cursor must equal the first occurrence id");
+
+            consoleInject("dup-observe", 1);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(193, false, 200, var(firstId)), 193, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 193, true, "");
+            auto const* second = consoleEntries(0);
+            check(second != nullptr && second->size() == 1, "(b) repeat advance must re-deliver the row");
+            int64 secondId = 0;
+            int64 afterSecond = 0;
+            if (second && second->size() == 1) {
+                checkConsoleEntry(second->getReference(0), "dup-observe", "warning", 2, "visible", "(b) repeat-updated row");
+                check(consoleEntryId(second->getReference(0), secondId), "(b) repeat-updated row must carry an id");
+                check(secondId > firstId, "(b) repeat-updated id must advance");
+            }
+            check(consoleCursorAt(0, afterSecond), "(b) repeat poll must carry a cursor");
+            check(afterSecond == secondId, "(b) cursor must equal the repeat-updated id");
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(194, false, 200, var(secondId)), 194, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 194, true, "");
+            auto const* exhaustedRepeat = consoleEntries(0);
+            check(exhaustedRepeat != nullptr && exhaustedRepeat->isEmpty(), "(b) polling past the repeat-updated id must be empty");
+            int64 stableRepeat = 0;
+            check(consoleCursorAt(0, stableRepeat), "(b) exhausted repeat poll must carry a cursor");
+            check(stableRepeat == secondId, "(b) cursor must stay at the repeat-updated id");
+
+            std::cout << "[cursor-lifecycle] (b) repeat-update observability passed" << std::endl;
+            consoleStep = 27;
+            startTimer(10);
+            break;
+        }
+        // (c) GUI clear/restore: whole rows move between history and visible, so
+        // ids survive unchanged and the cursor never moves.
+        case 27: {
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(195), 195, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 195, true, "");
+
+            int64 startCursor = 0;
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(196, true, 200), 196, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 196, true, "");
+            check(consoleCursorAt(0, startCursor), "(c) baseline poll must carry a cursor");
+
+            consoleInject("guiclr-a", 0);
+            consoleInject("guiclr-b", 1);
+            consoleInject("guiclr-c", 2);
+
+            String const guiTexts[] = { "guiclr-a", "guiclr-b", "guiclr-c" };
+            String const guiSeverities[] = { "message", "warning", "error" };
+
+            Array<int64> guiIds;
+            int64 visibleCursor = 0;
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(197, true, 200, var(startCursor)), 197, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 197, true, "");
+            auto const* visible = consoleEntries(0);
+            check(visible != nullptr && visible->size() == 3, "(c) three visible rows must exist before GUI clear");
+            if (visible && visible->size() == 3) {
+                for (int i = 0; i < 3; ++i) {
+                    checkConsoleEntry(visible->getReference(i), guiTexts[i], guiSeverities[i], 1, "visible",
+                        "(c) pre-clear visible entry " + String(i));
+                    int64 id = 0;
+                    if (consoleEntryId(visible->getReference(i), id))
+                        guiIds.add(id);
+                }
+            }
+            check(guiIds.size() == 3, "(c) GUI clear id capture must observe three ids");
+            check(consoleCursorAt(0, visibleCursor), "(c) visible poll must carry a cursor");
+
+            if (consoleComponent)
+                consoleComponent->clear();
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().size() == 3,
+                "(c) GUI clear must move visible rows into history");
+
+            int64 historyCursor = 0;
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(198, true, 200, var(startCursor)), 198, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 198, true, "");
+            auto const* history = consoleEntries(0);
+            check(history != nullptr && history->size() == 3, "(c) since_id below the cleared rows must surface history");
+            if (history && history->size() == 3) {
+                checkConsoleIdsIncreasing(history, "(c) history snapshot");
+                for (int i = 0; i < 3; ++i) {
+                    checkConsoleEntry(history->getReference(i), guiTexts[i], guiSeverities[i], 1, "history",
+                        "(c) history entry " + String(i));
+                    if (guiIds.size() == 3)
+                        checkConsoleEntryId(history->getReference(i), guiIds[i], "(c) history entry id " + String(i));
+                }
+            }
+            check(consoleCursorAt(0, historyCursor), "(c) history poll must carry a cursor");
+            check(historyCursor == visibleCursor, "(c) cursor must be unchanged across GUI clear");
+
+            if (consoleComponent)
+                consoleComponent->restore();
+            check(editor->pd->getConsoleMessages().size() == 3 && editor->pd->getConsoleHistory().empty(),
+                "(c) GUI restore must move history back into visible");
+
+            int64 restoredCursor = 0;
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(199, true, 200, var(startCursor)), 199, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 199, true, "");
+            auto const* restored = consoleEntries(0);
+            check(restored != nullptr && restored->size() == 3, "(c) restored rows must be visible again");
+            if (restored && restored->size() == 3) {
+                checkConsoleIdsIncreasing(restored, "(c) restored snapshot");
+                for (int i = 0; i < 3; ++i) {
+                    checkConsoleEntry(restored->getReference(i), guiTexts[i], guiSeverities[i], 1, "visible",
+                        "(c) restored entry " + String(i));
+                    if (guiIds.size() == 3)
+                        checkConsoleEntryId(restored->getReference(i), guiIds[i], "(c) restored entry id " + String(i));
+                }
+            }
+            check(consoleCursorAt(0, restoredCursor), "(c) restored poll must carry a cursor");
+            check(restoredCursor == visibleCursor, "(c) cursor must be unchanged across GUI restore");
+
+            std::cout << "[cursor-lifecycle] (c) GUI clear/restore id preservation passed" << std::endl;
+            consoleStep = 28;
+            startTimer(10);
+            break;
+        }
+        // (d) Hard clear: ids are never reset, the cursor retains its high-water,
+        // and post-clear rows continue above every pre-clear id. A poll from the
+        // pre-clear cursor returns exactly the new rows.
+        case 28: {
+            Array<int64> preClearIds;
+            int64 preClearCursor = 0;
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(200, true, 200), 200, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 200, true, "");
+            auto const* pre = consoleEntries(0);
+            check(pre != nullptr && pre->size() == 3, "(d) three rows must exist before hard clear");
+            if (pre)
+                for (auto const& entry : *pre) {
+                    int64 id = 0;
+                    if (consoleEntryId(entry, id))
+                        preClearIds.add(id);
+                }
+            check(preClearIds.size() == 3, "(d) hard-clear id capture must observe three ids");
+            check(consoleCursorAt(0, preClearCursor), "(d) pre-clear poll must carry a cursor");
+
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(201), 201, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 201, true, "");
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().empty(),
+                "(d) hard clear must empty both stores");
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(202, true, 200), 202, true, {});
+            sendRequest(makeGetConsoleRequest(203, true, 200, var(preClearCursor)), 203, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 202, true, "");
+            checkConsoleReply(1, 203, true, "");
+            auto const* clearedAbsent = consoleEntries(0);
+            check(clearedAbsent != nullptr && clearedAbsent->isEmpty(), "(d) post-clear entries must be empty");
+            int64 retainedCursor = 0;
+            check(consoleCursorAt(0, retainedCursor), "(d) post-clear poll must carry a cursor");
+            check(retainedCursor == preClearCursor, "(d) cursor must be retained across hard clear");
+            auto const* clearedSince = consoleEntries(1);
+            check(clearedSince != nullptr && clearedSince->isEmpty(), "(d) since_id at the pre-clear cursor must be empty after clear");
+
+            consoleInject("hc-new-a", 0);
+            consoleInject("hc-new-b", 1);
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(204, true, 200, var(preClearCursor)), 204, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 204, true, "");
+            auto const* fresh = consoleEntries(0);
+            check(fresh != nullptr && fresh->size() == 2, "(d) poll from the pre-clear cursor must return exactly the two new rows");
+            if (fresh && fresh->size() == 2) {
+                checkConsoleEntry(fresh->getReference(0), "hc-new-a", "message", 1, "visible", "(d) new row a");
+                checkConsoleEntry(fresh->getReference(1), "hc-new-b", "warning", 1, "visible", "(d) new row b");
+                int64 first = 0;
+                int64 second = 0;
+                consoleEntryId(fresh->getReference(0), first);
+                consoleEntryId(fresh->getReference(1), second);
+                check(first > preClearCursor, "(d) new ids must exceed the retained cursor");
+                if (preClearIds.size() == 3) {
+                    check(first > preClearIds[2], "(d) new ids must exceed every pre-clear id");
+                    check(second > preClearIds[2], "(d) the second new id must exceed every pre-clear id");
+                }
+                check(second > first, "(d) new ids must remain strictly increasing");
+                int64 afterFresh = 0;
+                check(consoleCursorAt(0, afterFresh), "(d) fresh poll must carry a cursor");
+                check(afterFresh == second, "(d) cursor must equal the newest new id");
+            }
+            checkConsoleIdsIncreasing(fresh, "(d) post-clear new rows");
+
+            std::cout << "[cursor-lifecycle] (d) hard clear retention and id continuation passed" << std::endl;
+            consoleStep = 29;
+            startTimer(10);
+            break;
+        }
+        // (e) Concurrent producers. Worker threads hammer logWarning while the
+        // message thread polls get_console with since_id. Only externally
+        // decidable invariants are asserted: every single poll returns strictly
+        // increasing ids, no observed id exceeds the final cursor, the final
+        // poll after producers join drains to empty, and the cursor stabilizes.
+        // Gap attribution is not decidable (most hammered ids collapse by
+        // design), so no gap-count assertion is made.
+        case 29: {
+            int64 pollCursor = 0;
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(210, true, 200), 210, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 210, true, "");
+            check(consoleCursorAt(0, pollCursor), "(e) pre-concurrency poll must carry a cursor");
+
+            stopConcurrentProducers.store(false);
+            concurrentProducers.clear();
+            for (int i = 0; i < 3; ++i) {
+                concurrentProducers.emplace_back([this, i] {
+                    String const text = "concurrent-noise-" + String(i);
+                    while (!stopConcurrentProducers.load())
+                        editor->pd->logWarning(text);
+                });
+            }
+
+            static constexpr int concurrencyPollCount = 120;
+            bool idsMonotonic = true;
+            int64 maxObservedId = pollCursor;
+            for (int i = 0; i < concurrencyPollCount && idsMonotonic; ++i) {
+                int const requestId = 211 + i;
+                consoleBegin();
+                sendRequest(makeGetConsoleRequest(requestId, false, 200, var(pollCursor)), requestId, true, {});
+                flushDebugQueue();
+                checkConsoleReply(0, requestId, true, "");
+
+                auto const* entries = consoleEntries(0);
+                if (entries == nullptr) {
+                    idsMonotonic = false;
+                    check(false, "(e) concurrent poll must expose an entries array");
+                    break;
+                }
+                int64 previous = 0;
+                for (auto const& entry : *entries) {
+                    int64 id = 0;
+                    if (!consoleEntryId(entry, id) || id <= previous) {
+                        idsMonotonic = false;
+                        break;
+                    }
+                    previous = id;
+                    maxObservedId = std::max(maxObservedId, id);
+                }
+                if (!idsMonotonic)
+                    break;
+
+                int64 replyCursor = pollCursor;
+                check(consoleCursorAt(0, replyCursor), "(e) concurrent poll must carry a cursor");
+                maxObservedId = std::max(maxObservedId, replyCursor);
+                if (replyCursor < pollCursor) {
+                    idsMonotonic = false;
+                    break;
+                }
+                pollCursor = replyCursor;
+            }
+            check(idsMonotonic, "(e) every concurrent poll must return strictly increasing ids");
+
+            stopConcurrentProducers.store(true);
+            for (auto& producer : concurrentProducers)
+                producer.join();
+            concurrentProducers.clear();
+
+            int64 finalCursor = pollCursor;
+            bool drained = false;
+            for (int i = 0; i < 50; ++i) {
+                int const requestId = 400 + i;
+                consoleBegin();
+                sendRequest(makeGetConsoleRequest(requestId, true, 200, var(finalCursor)), requestId, true, {});
+                flushDebugQueue();
+                checkConsoleReply(0, requestId, true, "");
+                auto const* entries = consoleEntries(0);
+                int64 replyCursor = finalCursor;
+                check(consoleCursorAt(0, replyCursor), "(e) drain poll must carry a cursor");
+                maxObservedId = std::max(maxObservedId, replyCursor);
+                if (replyCursor < finalCursor)
+                    break;
+                finalCursor = replyCursor;
+                if (entries != nullptr && entries->isEmpty()) {
+                    drained = true;
+                    break;
+                }
+            }
+            check(drained, "(e) a final poll after producers join must drain to empty");
+
+            int64 stableCursor = finalCursor;
+            for (int i = 0; i < 2; ++i) {
+                int const requestId = 450 + i;
+                consoleBegin();
+                sendRequest(makeGetConsoleRequest(requestId, true, 200, var(stableCursor)), requestId, true, {});
+                flushDebugQueue();
+                checkConsoleReply(0, requestId, true, "");
+                auto const* entries = consoleEntries(0);
+                check(entries != nullptr && entries->isEmpty(), "(e) post-join polls must stay empty");
+                int64 replyCursor = stableCursor;
+                check(consoleCursorAt(0, replyCursor), "(e) stabilizing poll must carry a cursor");
+                check(replyCursor == stableCursor, "(e) cursor must stabilize after producers join");
+                stableCursor = replyCursor;
+            }
+
+            check(maxObservedId <= finalCursor, "(e) no observed id may exceed the final cursor");
+
+            std::cout << "[cursor-lifecycle] (e) concurrent producers passed polls=" << concurrencyPollCount
+                      << " drained=" << (drained ? 1 : 0) << std::endl;
+            consoleStep = 30;
+            startTimer(10);
+            break;
+        }
+        // (f) 800-cap eviction. The visible store retains only the newest 800
+        // rows, so a cursor-0 poll cannot reach evicted rows; the returned window
+        // is bounded by max_entries and is not byte-truncated for short rows.
+        case 30: {
+            consoleBegin();
+            sendRequest(makeClearConsoleRequest(500), 500, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 500, true, "");
+            check(editor->pd->getConsoleMessages().empty() && editor->pd->getConsoleHistory().empty(),
+                "(f) eviction fixture must start empty");
+
+            for (int i = 0; i < 810; ++i)
+                consoleInject("evict-" + String(i), 0);
+
+            consoleBegin();
+            sendRequest(makeGetConsoleRequest(501, true, 200, var(static_cast<int64>(0))), 501, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 501, true, "");
+            check(editor->pd->getConsoleMessages().size() == 800, "(f) visible retention cap must stay at 800");
+
+            auto const* entries = consoleEntries(0);
+            check(entries != nullptr && entries->size() == 200, "(f) cursor-0 poll must return the newest 200-row window");
+            if (entries && entries->size() == 200) {
+                checkConsoleEntry(entries->getReference(0), "evict-610", "message", 1, "visible",
+                    "(f) oldest reachable row must be evict-610 (evicted rows are unreachable)");
+                checkConsoleEntry(entries->getReference(199), "evict-809", "message", 1, "visible",
+                    "(f) newest reachable row must be evict-809");
+                checkConsoleIdsIncreasing(entries, "(f) eviction window");
+            }
+            check(!consoleTruncated(0), "(f) a within-window poll must not be byte-truncated");
+
+            std::cout << "[cursor-lifecycle] (f) 800-cap eviction bounded window passed" << std::endl;
             finishConsole();
             break;
         }
