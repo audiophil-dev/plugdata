@@ -15,6 +15,7 @@
 #include <cmath>
 #include <string_view>
 #include "Instance.h"
+#include "Object.h"
 #include "Patch.h"
 #include "MessageListener.h"
 #include "Objects/ImplementationBase.h"
@@ -121,6 +122,20 @@ var makeClearSuccess(int const requestId)
     return var(response);
 }
 
+var makeExportSuccess(int const requestId, bool const clipped)
+{
+    auto* data = new DynamicObject();
+    data->setProperty("status", "saved");
+    data->setProperty("clipped", clipped);
+
+    auto* response = new DynamicObject();
+    response->setProperty("version", debugProtocolVersion);
+    response->setProperty("request_id", requestId);
+    response->setProperty("ok", true);
+    response->setProperty("data", var(data));
+    return var(response);
+}
+
 bool hasOnlySetGenerationFields(DynamicObject const& request)
 {
     auto const& properties = request.getProperties();
@@ -204,6 +219,38 @@ bool hasOnlyClearConsoleFields(DynamicObject const& request)
             return false;
     }
     return true;
+}
+
+bool hasOnlyExportCanvasFields(DynamicObject const& request)
+{
+    auto const& properties = request.getProperties();
+    if (properties.size() != 5)
+        return false;
+
+    bool sawVersion = false;
+    bool sawRequestId = false;
+    bool sawOperation = false;
+    bool sawGeneration = false;
+    bool sawPath = false;
+
+    for (auto const& [name, value] : properties) {
+        ignoreUnused(value);
+        auto const propertyName = name.toString();
+        if (propertyName == "version")
+            sawVersion = true;
+        else if (propertyName == "request_id")
+            sawRequestId = true;
+        else if (propertyName == "operation")
+            sawOperation = true;
+        else if (propertyName == "generation")
+            sawGeneration = true;
+        else if (propertyName == "path")
+            sawPath = true;
+        else
+            return false;
+    }
+
+    return sawVersion && sawRequestId && sawOperation && sawGeneration && sawPath;
 }
 
 class StrictJsonValidator {
@@ -1646,7 +1693,8 @@ void Instance::handleDebugMessage(Message const& message)
     auto const operation = request->getProperty("operation");
     if (!operation.isString()
         || (operation.toString() != "set_generation" && operation.toString() != "send_object"
-            && operation.toString() != "get_console" && operation.toString() != "clear_console")) {
+            && operation.toString() != "get_console" && operation.toString() != "clear_console"
+            && operation.toString() != "export_canvas")) {
         reply(makeDebugError(requestId, "UnknownOperation", "Unknown debug operation"), requestId);
         return;
     }
@@ -1895,6 +1943,130 @@ void Instance::handleDebugMessage(Message const& message)
         updateConsole(SmallString(), false, 0, false);
 
         reply(makeClearSuccess(requestId), requestId);
+        return;
+    }
+
+    if (operation.toString() == "export_canvas") {
+        if (!hasOnlyExportCanvasFields(*request)) {
+            reply(makeDebugError(requestId, "InvalidRequest", "export_canvas contains unknown or missing fields"), requestId);
+            return;
+        }
+
+        auto const generationValue = request->getProperty("generation");
+        auto const pathValue = request->getProperty("path");
+        if (!generationValue.isString()) {
+            reply(makeDebugError(requestId, "InvalidRequest", "generation and root_receiver must be strings"), requestId);
+            return;
+        }
+
+        String const generation = generationValue.toString();
+        if (generation.isEmpty() || generation.getNumBytesAsUTF8() > maxGenerationBytes) {
+            reply(makeDebugError(requestId, "InvalidRequest", "generation and root_receiver must contain 1 through 128 UTF-8 bytes"), requestId);
+            return;
+        }
+
+        if (!pathValue.isString()) {
+            reply(makeDebugError(requestId, "InvalidRequest", "path must be an absolute file path ending in .png"), requestId);
+            return;
+        }
+
+        String const path = pathValue.toString();
+        if (path.isEmpty() || !File::isAbsolutePath(path) || !path.endsWithIgnoreCase(".png")) {
+            reply(makeDebugError(requestId, "InvalidRequest", "path must be an absolute file path ending in .png"), requestId);
+            return;
+        }
+
+        // Resolve the registered root under a single Pd lock acquisition,
+        // capturing only the pointer value: the captured pointer is never
+        // dereferenced after the lock is released, and WeakReference::get()
+        // is never called under the lock.
+        String runtimeError;
+        void* capturedCanvas = nullptr;
+        lockAudioThread();
+        if (debugGeneration != generation) {
+            runtimeError = "StaleGeneration";
+        } else if (!debugRoot || !debugRoot->isValid()) {
+            runtimeError = "CanvasNotFound";
+        } else {
+            auto* canvas = debugRoot->getRawUnchecked<t_canvas>();
+            if (pd_class(&canvas->gl_obj.ob_pd) != canvas_class)
+                runtimeError = "CanvasNotFound";
+            else
+                capturedCanvas = canvas;
+        }
+        unlockAudioThread();
+
+        if (runtimeError.isNotEmpty()) {
+            auto const message = runtimeError == "StaleGeneration" ? "Generation does not match the active generation" : "Debug target could not be resolved";
+            reply(makeDebugError(requestId, runtimeError, message), requestId);
+            return;
+        }
+
+        // Match the captured pointer value against live canvases on the message
+        // thread; the captured value is only ever compared, never dereferenced.
+        Canvas* targetCanvas = nullptr;
+        for (auto* editor : static_cast<PluginProcessor*>(this)->getEditors()) {
+            for (auto* canvas : editor->getCanvases()) {
+                auto canvasPtr = canvas->patch.getPointer();
+                if (canvasPtr && canvasPtr.get() == capturedCanvas) {
+                    targetCanvas = canvas;
+                    break;
+                }
+            }
+            if (targetCanvas)
+                break;
+        }
+
+        if (!targetCanvas || !targetCanvas->isShowing()) {
+            reply(makeDebugError(requestId, "CanvasNotFound", "canvas is not currently displayed"), requestId);
+            return;
+        }
+
+        Rectangle<int> contentRegion;
+        if (getValue<bool>(targetCanvas->presentationMode)) {
+            contentRegion = Rectangle<int>(targetCanvas->canvasOrigin.x, targetCanvas->canvasOrigin.y,
+                getValue<int>(targetCanvas->patchWidth), getValue<int>(targetCanvas->patchHeight));
+        } else {
+            bool hasContent = false;
+            for (auto const* object : targetCanvas->objects) {
+                auto const bounds = object->getBounds();
+                contentRegion = hasContent ? contentRegion.getUnion(bounds) : bounds;
+                hasContent = true;
+            }
+            if (hasContent)
+                contentRegion = contentRegion.expanded(24);
+        }
+
+        if (contentRegion.isEmpty()) {
+            reply(makeDebugError(requestId, "ExportFailed", "canvas has no visible content"), requestId);
+            return;
+        }
+
+        auto const topLeft = targetCanvas->editor->getLocalPoint(targetCanvas, contentRegion.getTopLeft());
+        auto const bottomRight = targetCanvas->editor->getLocalPoint(targetCanvas, contentRegion.getBottomRight());
+        auto const editorRegion = Rectangle<int>::leftTopRightBottom(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y);
+        auto const visibleRegion = editorRegion.getIntersection(targetCanvas->editor->getLocalBounds());
+        if (visibleRegion.isEmpty()) {
+            reply(makeDebugError(requestId, "ExportFailed", "canvas has no visible content"), requestId);
+            return;
+        }
+
+        bool const clipped = visibleRegion != editorRegion;
+
+        auto const image = targetCanvas->editor->nvgSurface.renderToImage(visibleRegion);
+        if (image.isNull()) {
+            reply(makeDebugError(requestId, "ExportFailed", "framebuffer readback failed"), requestId);
+            return;
+        }
+
+        File const file(path);
+        FileOutputStream fos(file);
+        if (!fos.openedOk() || !PNGImageFormat().writeImageToStream(image, fos)) {
+            reply(makeDebugError(requestId, "ExportFailed", "failed to write png file"), requestId);
+            return;
+        }
+
+        reply(makeExportSuccess(requestId, clipped), requestId);
         return;
     }
 

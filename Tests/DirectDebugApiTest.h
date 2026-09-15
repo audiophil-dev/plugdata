@@ -124,6 +124,100 @@ private:
         return var(request);
     }
 
+    static var makeExportCanvasRequest(int const requestId, String const& generation, var const& path, bool const addExtraField = false)
+    {
+        auto* request = new DynamicObject();
+        request->setProperty("version", 1);
+        request->setProperty("request_id", requestId);
+        request->setProperty("operation", "export_canvas");
+        request->setProperty("generation", generation);
+        request->setProperty("path", path);
+        if (addExtraField)
+            request->setProperty("extra", true);
+        return var(request);
+    }
+
+    static String makeExportFixturePatch()
+    {
+        // A single object placed well inside the visible viewport so the +24 px
+        // content margin stays fully visible (clipped: false).
+        return "#N canvas 100 100 300 200 12;\n#X obj 100 100 print export-target;\n";
+    }
+
+    // Mirrors the implementation's content-region computation: union of the
+    // object bounds expanded by 24 px, mapped through the live canvas
+    // transform and clipped to the editor.
+    Rectangle<int> exportExpectedRegion(Canvas* canvas) const
+    {
+        Rectangle<int> contentBounds;
+        bool hasContent = false;
+        for (auto const* object : canvas->objects) {
+            auto const bounds = object->getBounds();
+            contentBounds = hasContent ? contentBounds.getUnion(bounds) : bounds;
+            hasContent = true;
+        }
+        if (!hasContent)
+            return {};
+
+        contentBounds = contentBounds.expanded(24);
+        auto const topLeft = editor->getLocalPoint(canvas, contentBounds.getTopLeft());
+        auto const bottomRight = editor->getLocalPoint(canvas, contentBounds.getBottomRight());
+        auto const mapped = Rectangle<int>::leftTopRightBottom(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y);
+        return mapped.getIntersection(editor->getLocalBounds());
+    }
+
+    void checkExportSaved(int const responseIndex, bool const expectedClipped)
+    {
+        check(responseIndex < responses.size(), "export reply must be received");
+        if (responseIndex >= responses.size())
+            return;
+        auto* response = responses[responseIndex].getDynamicObject();
+        check(response != nullptr, "export reply must be an object");
+        if (!response)
+            return;
+        check(static_cast<bool>(response->getProperty("ok")), "export reply ok must be true");
+        auto* data = response->getProperty("data").getDynamicObject();
+        check(data != nullptr, "export success must carry a data object");
+        if (!data)
+            return;
+        check(data->getProperties().size() == 2, "export success data must contain exactly status and clipped");
+        check(data->getProperty("status").isString() && data->getProperty("status").toString() == "saved",
+            "export success status must be saved");
+        check(data->getProperty("clipped").isBool() && static_cast<bool>(data->getProperty("clipped")) == expectedClipped,
+            "export clipped flag must match");
+    }
+
+    void checkExportFile(File const& file, Rectangle<int> const& expectedLogical, String const& description)
+    {
+        check(file.existsAsFile(), description + " must create the requested file");
+        check(file.getSize() > 0, description + " file must be non-empty");
+        if (!file.existsAsFile())
+            return;
+
+        unsigned char const expectedMagic[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+        unsigned char magic[8] = {};
+        FileInputStream magicStream(file);
+        int const magicBytes = magicStream.read(magic, 8);
+        bool magicOk = magicBytes == 8;
+        for (int i = 0; i < 8 && magicOk; ++i)
+            magicOk = magic[i] == expectedMagic[i];
+        check(magicOk, description + " file must start with the PNG magic bytes");
+
+        FileInputStream decodeStream(file);
+        Image const decoded = PNGImageFormat().decodeImage(decodeStream);
+        check(!decoded.isNull(), description + " file must decode as PNG");
+        if (decoded.isNull())
+            return;
+
+        auto const renderScale = editor->getRenderScale();
+        int const expectedWidth = roundToInt(static_cast<float>(expectedLogical.getWidth()) * renderScale);
+        int const expectedHeight = roundToInt(static_cast<float>(expectedLogical.getHeight()) * renderScale);
+        check(decoded.getWidth() == expectedWidth && decoded.getHeight() == expectedHeight,
+            description + " png dimensions must match the visible content region scaled by the render scale (expected "
+                + String(expectedWidth) + "x" + String(expectedHeight) + ", actual " + String(decoded.getWidth()) + "x"
+                + String(decoded.getHeight()) + ")");
+    }
+
     void consoleBegin()
     {
         responses.clear();
@@ -1921,6 +2015,165 @@ private:
             check(!consoleTruncated(0), "(f) a within-window poll must not be byte-truncated");
 
             std::cout << "[cursor-lifecycle] (f) 800-cap eviction bounded window passed" << std::endl;
+            consoleStep = 31;
+            startTimer(10);
+            break;
+        }
+        // (export) Task 1: export_canvas happy path. Opens a dedicated fixture
+        // canvas with one object inside the visible viewport, registers a
+        // generation, and exports the visible content region to a unique temp
+        // file; the PNG must decode with exactly the region's pixel dimensions.
+        case 31: {
+            exportRootReceiver = "export-root";
+            exportCanvas = editor->getTabComponent().openPatch(makeExportFixturePatch());
+            check(exportCanvas != nullptr, "the export fixture canvas must open");
+            if (!exportCanvas) {
+                finishConsole();
+                break;
+            }
+            exportCanvas->performSynchronise();
+            auto* exportRoot = exportCanvas->patch.getRawPointer();
+            editor->pd->lockAudioThread();
+            pd_bind(&exportRoot->gl_obj.ob_pd, editor->pd->generateSymbol(exportRootReceiver));
+            editor->pd->unlockAudioThread();
+
+            consoleBegin();
+            sendRequest(makeSetGenerationRequest(600, "export-generation", exportRootReceiver), 600, true, {});
+            flushDebugQueue();
+            checkConsoleReply(0, 600, true, "");
+            exportGeneration = "export-generation";
+
+            // Start from the patch origin at 100% zoom so the fixture object is
+            // deterministically inside the visible viewport.
+            exportCanvas->restoreViewportState();
+            check(std::abs(getValue<float>(exportCanvas->zoomScale) - 1.0f) < 0.001f,
+                "export fixture must be pinned at 100% zoom");
+            exportExpectedLogical = exportExpectedRegion(exportCanvas);
+            check(!exportExpectedLogical.isEmpty(), "export fixture object must be inside the visible viewport");
+
+            File const tempDir = File::getSpecialLocation(File::tempDirectory);
+            exportTempFile = tempDir.getChildFile("plugdata-export-" + String(Time::currentTimeMillis()) + ".png");
+            exportTempFile.deleteFile();
+
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(601, exportGeneration, exportTempFile.getFullPathName()), 601, true, {});
+            flushDebugQueue();
+            checkExportSaved(0, false);
+            checkExportFile(exportTempFile, exportExpectedLogical, "export");
+
+            exportTempFileUpper = tempDir.getChildFile("plugdata-export-" + String(Time::currentTimeMillis()) + ".PNG");
+            exportTempFileUpper.deleteFile();
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(602, exportGeneration, exportTempFileUpper.getFullPathName()), 602, true, {});
+            flushDebugQueue();
+            checkExportSaved(0, false);
+            checkExportFile(exportTempFileUpper, exportExpectedLogical, "uppercase-extension export");
+
+            std::cout << "[export] (a) happy path logical=" << exportExpectedLogical.getWidth() << "x"
+                      << exportExpectedLogical.getHeight() << " renderScale=" << editor->getRenderScale()
+                      << " clipped=false" << std::endl;
+            consoleStep = 32;
+            startTimer(10);
+            break;
+        }
+        // (export) Request-shape rejections: every malformed field set replies
+        // exactly once with InvalidRequest and creates no file.
+        case 32: {
+            File const tempDir = File::getSpecialLocation(File::tempDirectory);
+            String const absolutePng = tempDir.getChildFile("plugdata-export-matrix.png").getFullPathName();
+            String const absoluteJpg = tempDir.getChildFile("plugdata-export-matrix.jpg").getFullPathName();
+
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(610, exportGeneration, "relative/path.png"), 610, false, "InvalidRequest");
+            sendRequest(makeExportCanvasRequest(611, exportGeneration, absoluteJpg), 611, false, "InvalidRequest");
+            sendRequest(makeExportCanvasRequest(612, exportGeneration, ""), 612, false, "InvalidRequest");
+            sendRequest(makeExportCanvasRequest(613, exportGeneration, var(42)), 613, false, "InvalidRequest");
+            sendRequest(makeExportCanvasRequest(614, "", absolutePng), 614, false, "InvalidRequest");
+            sendRequest(makeExportCanvasRequest(615, String::repeatedString("g", 129), absolutePng), 615, false, "InvalidRequest");
+            sendRequest(makeExportCanvasRequest(616, exportGeneration, absolutePng, true), 616, false, "InvalidRequest");
+            flushDebugQueue();
+
+            for (int i = 0; i < 7; ++i)
+                checkConsoleReply(i, 610 + i, false, "InvalidRequest");
+            checkConsoleErrorMessage(0, "path must be an absolute file path ending in .png");
+            checkConsoleErrorMessage(1, "path must be an absolute file path ending in .png");
+            checkConsoleErrorMessage(2, "path must be an absolute file path ending in .png");
+            checkConsoleErrorMessage(3, "path must be an absolute file path ending in .png");
+            checkConsoleErrorMessage(4, "generation and root_receiver must contain 1 through 128 UTF-8 bytes");
+            checkConsoleErrorMessage(5, "generation and root_receiver must contain 1 through 128 UTF-8 bytes");
+            checkConsoleErrorMessage(6, "export_canvas contains unknown or missing fields");
+            check(!File(absolutePng).existsAsFile(), "rejected export paths must not create a file");
+
+            std::cout << "[export] (b) invalid-request matrix passed cases=7" << std::endl;
+            consoleStep = 33;
+            startTimer(10);
+            break;
+        }
+        // (export) A live but non-displayed registered canvas is rejected.
+        case 33: {
+            hiddenExportCanvas = editor->getTabComponent().openPatch(makeFixturePatch());
+            check(hiddenExportCanvas != nullptr, "the hidden-canvas fixture must open");
+            if (hiddenExportCanvas)
+                hiddenExportCanvas->performSynchronise();
+
+            File const tempDir = File::getSpecialLocation(File::tempDirectory);
+            String const rejectedPath = tempDir.getChildFile("plugdata-export-hidden.png").getFullPathName();
+            File(rejectedPath).deleteFile();
+
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(620, exportGeneration, rejectedPath), 620, false, "CanvasNotFound");
+            flushDebugQueue();
+            checkConsoleReply(0, 620, false, "CanvasNotFound");
+            checkConsoleErrorMessage(0, "canvas is not currently displayed");
+            check(!File(rejectedPath).existsAsFile(), "hidden-canvas export must not create a file");
+
+            if (hiddenExportCanvas) {
+                editor->getTabComponent().closeTab(hiddenExportCanvas);
+                hiddenExportCanvas = nullptr;
+            }
+
+            std::cout << "[export] (c) hidden canvas rejected CanvasNotFound" << std::endl;
+            consoleStep = 34;
+            startTimer(10);
+            break;
+        }
+        // (export) Destroying the registered root while its token stays active
+        // invalidates the weak reference (CanvasNotFound); an unknown token is
+        // still StaleGeneration.
+        case 34: {
+            editor->pd->lockAudioThread();
+            if (auto* root = exportCanvas->patch.getRawPointer())
+                pd_unbind(&root->gl_obj.ob_pd, editor->pd->generateSymbol(exportRootReceiver));
+            editor->pd->unlockAudioThread();
+
+            editor->getTabComponent().closeTab(exportCanvas);
+            exportCanvas = nullptr;
+
+            File const tempDir = File::getSpecialLocation(File::tempDirectory);
+            String const rejectedPath = tempDir.getChildFile("plugdata-export-deleted.png").getFullPathName();
+            File(rejectedPath).deleteFile();
+
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(630, exportGeneration, rejectedPath), 630, false, "CanvasNotFound");
+            flushDebugQueue();
+            checkConsoleReply(0, 630, false, "CanvasNotFound");
+            check(!File(rejectedPath).existsAsFile(), "deleted-root export must not create a file");
+
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(631, "export-generation-stale", rejectedPath), 631, false, "StaleGeneration");
+            flushDebugQueue();
+            checkConsoleReply(0, 631, false, "StaleGeneration");
+
+            auto& tabbar = editor->getTabComponent();
+            while (auto* canvas = tabbar.getCurrentCanvas())
+                tabbar.closeTab(canvas);
+
+            if (exportTempFile.existsAsFile())
+                exportTempFile.deleteFile();
+            if (exportTempFileUpper.existsAsFile())
+                exportTempFileUpper.deleteFile();
+
+            std::cout << "[export] (d) deleted root and stale token paths passed" << std::endl;
             finishConsole();
             break;
         }
@@ -2028,4 +2281,12 @@ private:
     int64 lastIdBeforeHardClear = 0;
     Array<int64> guiClearIds;
     Array<int64> cursorBaseIds;
+
+    Canvas* exportCanvas = nullptr;
+    Canvas* hiddenExportCanvas = nullptr;
+    String exportRootReceiver;
+    String exportGeneration;
+    File exportTempFile;
+    File exportTempFileUpper;
+    Rectangle<int> exportExpectedLogical;
 };
