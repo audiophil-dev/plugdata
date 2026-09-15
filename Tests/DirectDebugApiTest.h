@@ -146,8 +146,8 @@ private:
 
     // Mirrors the implementation's content-region computation: union of the
     // object bounds expanded by 24 px, mapped through the live canvas
-    // transform and clipped to the editor.
-    Rectangle<int> exportExpectedRegion(Canvas* canvas) const
+    // transform (before clipping to the editor).
+    Rectangle<int> exportMappedContentRegion(Canvas* canvas) const
     {
         Rectangle<int> contentBounds;
         bool hasContent = false;
@@ -162,8 +162,44 @@ private:
         contentBounds = contentBounds.expanded(24);
         auto const topLeft = editor->getLocalPoint(canvas, contentBounds.getTopLeft());
         auto const bottomRight = editor->getLocalPoint(canvas, contentBounds.getBottomRight());
-        auto const mapped = Rectangle<int>::leftTopRightBottom(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y);
-        return mapped.getIntersection(editor->getLocalBounds());
+        return Rectangle<int>::leftTopRightBottom(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y);
+    }
+
+    Rectangle<int> exportExpectedRegion(Canvas* canvas) const
+    {
+        return exportMappedContentRegion(canvas).getIntersection(editor->getLocalBounds());
+    }
+
+    Canvas* openBoundExportFixture(String const& patchContent, String const& receiver)
+    {
+        auto* canvas = editor->getTabComponent().openPatch(patchContent);
+        if (!canvas)
+            return nullptr;
+        canvas->performSynchronise();
+        auto* root = canvas->patch.getRawPointer();
+        editor->pd->lockAudioThread();
+        pd_bind(&root->gl_obj.ob_pd, editor->pd->generateSymbol(receiver));
+        editor->pd->unlockAudioThread();
+        return canvas;
+    }
+
+    void closeExportFixture(Canvas* canvas, String const& receiver)
+    {
+        if (!canvas)
+            return;
+        editor->pd->lockAudioThread();
+        if (auto* root = canvas->patch.getRawPointer())
+            pd_unbind(&root->gl_obj.ob_pd, editor->pd->generateSymbol(receiver));
+        editor->pd->unlockAudioThread();
+        editor->getTabComponent().closeTab(canvas);
+    }
+
+    void registerExportGeneration(int const requestId, String const& generation, String const& receiver)
+    {
+        consoleBegin();
+        sendRequest(makeSetGenerationRequest(requestId, generation, receiver), requestId, true, {});
+        flushDebugQueue();
+        checkConsoleReply(0, requestId, true, "");
     }
 
     void checkExportSaved(int const responseIndex, bool const expectedClipped)
@@ -2174,6 +2210,201 @@ private:
                 exportTempFileUpper.deleteFile();
 
             std::cout << "[export] (d) deleted root and stale token paths passed" << std::endl;
+            consoleStep = 35;
+            startTimer(10);
+            break;
+        }
+        // (export) Task 2 (g)/(f): a canvas with no objects and a canvas whose
+        // only object is outside the viewport both have an empty visible region
+        // and must be rejected before any rendering or file write.
+        case 35: {
+            auto* zeroCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n", "export-zero-root");
+            check(zeroCanvas != nullptr, "the zero-object export fixture must open");
+            if (zeroCanvas) {
+                registerExportGeneration(640, "export-zero-generation", "export-zero-root");
+
+                File const tempDir = File::getSpecialLocation(File::tempDirectory);
+                File const zeroFile = tempDir.getChildFile("plugdata-export-zero-" + String(Time::currentTimeMillis()) + ".png");
+                zeroFile.deleteFile();
+
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(641, "export-zero-generation", zeroFile.getFullPathName()), 641, false, "ExportFailed");
+                flushDebugQueue();
+                checkConsoleReply(0, 641, false, "ExportFailed");
+                checkConsoleErrorMessage(0, "canvas has no visible content");
+                check(!zeroFile.existsAsFile(), "zero-object export must not create a file");
+
+                closeExportFixture(zeroCanvas, "export-zero-root");
+            }
+
+            auto* farCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 20000 print far-target;\n", "export-far-root");
+            check(farCanvas != nullptr, "the offscreen-object export fixture must open");
+            if (farCanvas) {
+                registerExportGeneration(642, "export-far-generation", "export-far-root");
+                check(exportExpectedRegion(farCanvas).isEmpty(), "the offscreen object must map outside the editor");
+
+                File const tempDir = File::getSpecialLocation(File::tempDirectory);
+                File const farFile = tempDir.getChildFile("plugdata-export-far-" + String(Time::currentTimeMillis()) + ".png");
+                farFile.deleteFile();
+
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(643, "export-far-generation", farFile.getFullPathName()), 643, false, "ExportFailed");
+                flushDebugQueue();
+                checkConsoleReply(0, 643, false, "ExportFailed");
+                checkConsoleErrorMessage(0, "canvas has no visible content");
+                check(!farFile.existsAsFile(), "offscreen export must not create a file");
+
+                closeExportFixture(farCanvas, "export-far-root");
+            }
+
+            std::cout << "[export] (g)+(f) empty visible region paths passed" << std::endl;
+            consoleStep = 36;
+            startTimer(10);
+            break;
+        }
+        // (export) Task 2 (a)/(b): content that extends past the viewport is
+        // clipped to the visible intersection, and re-exporting to an existing
+        // path replaces its contents.
+        case 36: {
+            auto* clipCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n#X obj 100 100 print clip-top;\n#X obj 100 20000 print clip-bottom;\n",
+                "export-clip-root");
+            check(clipCanvas != nullptr, "the clipping export fixture must open");
+            if (clipCanvas) {
+                registerExportGeneration(650, "export-clip-generation", "export-clip-root");
+
+                auto const mapped = exportMappedContentRegion(clipCanvas);
+                auto const visible = exportExpectedRegion(clipCanvas);
+                check(!visible.isEmpty(), "the clipping fixture must have a visible region");
+                check(visible != mapped, "the clipping fixture content must exceed the visible region");
+
+                File const tempDir = File::getSpecialLocation(File::tempDirectory);
+                File const clipFile = tempDir.getChildFile("plugdata-export-clip-" + String(Time::currentTimeMillis()) + ".png");
+                clipFile.deleteFile();
+
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(651, "export-clip-generation", clipFile.getFullPathName()), 651, true, {});
+                flushDebugQueue();
+                checkExportSaved(0, true);
+                checkExportFile(clipFile, visible, "clipped export");
+                int64 const clippedSize = clipFile.getSize();
+                int const clippedHeight = visible.getHeight();
+
+                closeExportFixture(clipCanvas, "export-clip-root");
+
+                // (b) Overwrite: a second export to the same path with shorter
+                // content must replace the file; an appending writer would leave
+                // the tall png first and the short one trailing.
+                auto* overwriteCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 100 print overwrite-target;\n", "export-overwrite-root");
+                check(overwriteCanvas != nullptr, "the overwrite export fixture must open");
+                if (overwriteCanvas) {
+                    registerExportGeneration(652, "export-overwrite-generation", "export-overwrite-root");
+                    auto const overwriteRegion = exportExpectedRegion(overwriteCanvas);
+                    check(!overwriteRegion.isEmpty(), "the overwrite fixture must have a visible region");
+                    check(overwriteRegion.getHeight() < clippedHeight, "the overwrite fixture must be shorter than the clipped fixture");
+
+                    consoleBegin();
+                    sendRequest(makeExportCanvasRequest(653, "export-overwrite-generation", clipFile.getFullPathName()), 653, true, {});
+                    flushDebugQueue();
+                    checkExportSaved(0, false);
+                    checkExportFile(clipFile, overwriteRegion, "overwrite export");
+                    check(clipFile.getSize() < clippedSize,
+                        "overwrite export must replace the previous file instead of appending to it");
+
+                    if (clipFile.existsAsFile())
+                        clipFile.deleteFile();
+                    closeExportFixture(overwriteCanvas, "export-overwrite-root");
+                }
+            }
+
+            std::cout << "[export] (a)+(b) clipping and overwrite passed" << std::endl;
+            consoleStep = 37;
+            startTimer(10);
+            break;
+        }
+        // (export) Task 2 (e): a path whose parent directory does not exist
+        // fails the write and leaves nothing behind.
+        case 37: {
+            auto* writeCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 100 print write-target;\n", "export-write-root");
+            check(writeCanvas != nullptr, "the unwritable-target export fixture must open");
+            if (writeCanvas) {
+                registerExportGeneration(660, "export-write-generation", "export-write-root");
+
+                File const tempDir = File::getSpecialLocation(File::tempDirectory);
+                String const missingDir = tempDir.getChildFile("plugdata-export-missing-" + String(Time::currentTimeMillis())).getFullPathName();
+                String const unwritablePath = missingDir + "/out.png";
+                check(File::isAbsolutePath(unwritablePath) && unwritablePath.endsWithIgnoreCase(".png"),
+                    "the unwritable fixture path must still pass path validation");
+
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(661, "export-write-generation", unwritablePath), 661, false, "ExportFailed");
+                flushDebugQueue();
+                checkConsoleReply(0, 661, false, "ExportFailed");
+                checkConsoleErrorMessage(0, "failed to write png file");
+                check(!File(unwritablePath).existsAsFile(), "unwritable export must not create a file");
+                check(!File(missingDir).isDirectory(), "unwritable export must not create the missing directory");
+
+                closeExportFixture(writeCanvas, "export-write-root");
+            }
+
+            std::cout << "[export] (e) unwritable target rejected ExportFailed" << std::endl;
+            consoleStep = 38;
+            startTimer(10);
+            break;
+        }
+        // (export) Task 2 (c)/(d): a replacement generation invalidates the old
+        // token (StaleGeneration, no file), while a destroyed root presenting
+        // the active token is CanvasNotFound; closing a registered canvas
+        // mid-flow is the same.
+        case 38: {
+            File const tempDir = File::getSpecialLocation(File::tempDirectory);
+            File const staleFile = tempDir.getChildFile("plugdata-export-stale-" + String(Time::currentTimeMillis()) + ".png");
+            staleFile.deleteFile();
+
+            auto* oldCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 100 print stale-old;\n", "export-stale-old");
+            check(oldCanvas != nullptr, "the old-generation fixture must open");
+            if (oldCanvas) {
+                registerExportGeneration(670, "export-generation-old", "export-stale-old");
+                closeExportFixture(oldCanvas, "export-stale-old");
+
+                auto* newCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 100 print stale-new;\n", "export-stale-new");
+                check(newCanvas != nullptr, "the new-generation fixture must open");
+                if (newCanvas) {
+                    registerExportGeneration(671, "export-generation-new", "export-stale-new");
+
+                    consoleBegin();
+                    sendRequest(makeExportCanvasRequest(672, "export-generation-old", staleFile.getFullPathName()), 672, false, "StaleGeneration");
+                    flushDebugQueue();
+                    checkConsoleReply(0, 672, false, "StaleGeneration");
+                    check(!staleFile.existsAsFile(), "stale-generation export must not create a file");
+
+                    closeExportFixture(newCanvas, "export-stale-new");
+
+                    consoleBegin();
+                    sendRequest(makeExportCanvasRequest(673, "export-generation-new", staleFile.getFullPathName()), 673, false, "CanvasNotFound");
+                    flushDebugQueue();
+                    checkConsoleReply(0, 673, false, "CanvasNotFound");
+                    check(!staleFile.existsAsFile(), "deleted-root export must not create a file");
+                }
+            }
+
+            File const closedFile = tempDir.getChildFile("plugdata-export-closed-" + String(Time::currentTimeMillis()) + ".png");
+            closedFile.deleteFile();
+
+            auto* closedCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 100 print closed-target;\n", "export-closed-root");
+            check(closedCanvas != nullptr, "the closed-canvas fixture must open");
+            if (closedCanvas) {
+                registerExportGeneration(680, "export-closed-generation", "export-closed-root");
+                closeExportFixture(closedCanvas, "export-closed-root");
+
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(681, "export-closed-generation", closedFile.getFullPathName()), 681, false, "CanvasNotFound");
+                flushDebugQueue();
+                checkConsoleReply(0, 681, false, "CanvasNotFound");
+                check(!closedFile.existsAsFile(), "closed-canvas export must not create a file");
+            }
+
+            std::cout << "[export] (c)+(d) stale generation and closed canvas passed" << std::endl;
             finishConsole();
             break;
         }

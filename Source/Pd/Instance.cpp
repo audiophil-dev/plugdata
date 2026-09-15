@@ -2059,7 +2059,15 @@ void Instance::handleDebugMessage(Message const& message)
             return;
         }
 
+        // FileOutputStream appends to an existing file instead of truncating it
+        // (POSIX open O_RDWR + seek to end), so remove any previous export
+        // first to guarantee overwrite semantics.
         File const file(path);
+        if (file.existsAsFile() && !file.deleteFile()) {
+            reply(makeDebugError(requestId, "ExportFailed", "failed to write png file"), requestId);
+            return;
+        }
+
         FileOutputStream fos(file);
         if (!fos.openedOk() || !PNGImageFormat().writeImageToStream(image, fos)) {
             reply(makeDebugError(requestId, "ExportFailed", "failed to write png file"), requestId);
