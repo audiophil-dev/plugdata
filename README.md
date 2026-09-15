@@ -152,13 +152,31 @@ with `request_id: 0`.
   historical console state. This hard clear is a separate, non-reversible
   operation from the sidebar's own "clear" button, which still just moves
   visible entries into history for later restore.
+- `export_canvas` renders the registered root canvas at its current zoom
+  and scroll position and writes the visible content region to `path`, an
+  absolute file path ending in `.png` (anything else replies
+  `InvalidRequest`). It presents the same `generation` token as
+  `send_object`: the generation must still be registered, and the canvas
+  must be currently displayed, otherwise the reply is `StaleGeneration` or
+  `CanvasNotFound`. v1 is root-only - there is no `canvas_path`, and no
+  `scale` or `fit` parameter. The capture is the canvas content region (the
+  union of all object bounds plus a margin) mapped through the current view
+  and clipped to the visible editor area, so offscreen content is excluded;
+  the reply carries only `status: "saved"`
+  and `clipped: true` when the content extent reaches past the captured
+  region (`false` otherwise), and never carries image bytes. An existing
+  file at `path` is overwritten. A canvas with no objects, content that
+  lies entirely outside the viewport, or a target file that cannot be
+  opened or written replies `ExportFailed`. The plugin process writes the
+  requested path, so this operation is intended for the local managed-tool
+  trust boundary.
 
 ### Stable errors
 
 `InvalidEnvelope`, `UnsupportedProtocolVersion`, `PayloadTooLarge`,
 `InvalidRequest`, `UnknownOperation`, `StaleGeneration`, `CanvasNotFound`,
 `CanvasTypeMismatch`, `ObjectNotFound`, `ObjectTypeMismatch`,
-`InvalidSelector`, `InvalidAtoms`, `ResponseTooLarge`.
+`InvalidSelector`, `InvalidAtoms`, `ResponseTooLarge`, `ExportFailed`.
 
 ### Limits
 
