@@ -380,10 +380,13 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     setSize(pd->lastUIWidth, pd->lastUIHeight);
 
 #if ENABLE_TESTING
-    // Call after window is ready
-    ::Timer::callAfterDelay(200, [this]() {
-        runTests(this);
-    });
+    // Gate: pd-mcp managed sessions launch this build without the env var and must stay up
+    if (SystemStats::getEnvironmentVariable("PLUGDATA_RUN_TESTS", {}) == "1") {
+        // Call after window is ready
+        ::Timer::callAfterDelay(200, [this]() {
+            runTests(this);
+        });
+    }
 #endif
 
     pd->messageDispatcher->setBlockMessages(false);
