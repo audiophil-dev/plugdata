@@ -134,7 +134,9 @@ with `request_id: 0`.
   `InvalidRequest`), oldest to newest, each with its
   text, `message`/`warning`/`error` severity, repeat count, a stable
   monotonic `id`, and whether it came from the visible buffer or (when
-  `include_history` is set) history. Entries never include origin pointers.
+  `include_history` is true) history. `include_history` is a required
+  boolean field; requests missing it, or carrying any field outside the
+  set above, reply `InvalidRequest`. Entries never include origin pointers.
   An optional `since_id` field (a non-negative integer; any other type or a
   negative value replies `InvalidRequest`) selects only entries with
   `id` greater than `since_id`, after which the newest-`max_entries` suffix
