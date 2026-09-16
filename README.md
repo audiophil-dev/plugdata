@@ -126,7 +126,10 @@ with `request_id: 0`.
 - `send_object` resolves `canvas_path` (a zero-based sequence of `gl_list`
   ordinals from the registered root) plus `object_ordinal`, then sends
   `bang`, `float`, `symbol`, `list`, or an arbitrary selector with atoms to
-  that object's normal left inlet. The reply's `status: "invoked"`
+  that entry's normal left inlet. Valid targets are object boxes and
+  message boxes: banging a message box outputs its stored content.
+  Comments and canvases are refused with `ObjectTypeMismatch` or
+  `CanvasTypeMismatch`. The reply's `status: "invoked"`
   acknowledges only that the message was delivered - it makes no claim
   about the object's resulting state or DSP output.
 - `get_console` returns the newest `max_entries` console entries (a
