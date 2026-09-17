@@ -126,7 +126,10 @@ with `request_id: 0`.
 - `send_object` resolves `canvas_path` (a zero-based sequence of `gl_list`
   ordinals from the registered root) plus `object_ordinal`, then sends
   `bang`, `float`, `symbol`, `list`, or an arbitrary selector with atoms to
-  that object's normal left inlet. The reply's `status: "invoked"`
+  that entry's normal left inlet. Valid targets are object boxes and
+  message boxes: banging a message box outputs its stored content.
+  Comments and canvases are refused with `ObjectTypeMismatch` or
+  `CanvasTypeMismatch`. The reply's `status: "invoked"`
   acknowledges only that the message was delivered - it makes no claim
   about the object's resulting state or DSP output.
 - `get_console` returns the newest `max_entries` console entries (a
@@ -134,7 +137,9 @@ with `request_id: 0`.
   `InvalidRequest`), oldest to newest, each with its
   text, `message`/`warning`/`error` severity, repeat count, a stable
   monotonic `id`, and whether it came from the visible buffer or (when
-  `include_history` is set) history. Entries never include origin pointers.
+  `include_history` is true) history. `include_history` is a required
+  boolean field; requests missing it, or carrying any field outside the
+  set above, reply `InvalidRequest`. Entries never include origin pointers.
   An optional `since_id` field (a non-negative integer; any other type or a
   negative value replies `InvalidRequest`) selects only entries with
   `id` greater than `since_id`, after which the newest-`max_entries` suffix

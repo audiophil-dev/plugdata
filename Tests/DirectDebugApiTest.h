@@ -541,6 +541,8 @@ private:
         sendRequest(makeSendObjectRequest(60, generation, {}, 0, "float", { 1.0e100 }), 60, false, "InvalidAtoms");
         sendRequest(makeSendObjectRequest(61, generation, {}, 0, "", noAtoms), 61, false, "InvalidSelector");
         sendRequest(makeSendObjectRequest(62, generation, {}, 1, "bang", noAtoms), 62, false, "ObjectTypeMismatch");
+        sendObject(63, {}, 3, "bang", noAtoms);
+        expectPrint("direct-root", "content-from-box");
 
         // Boundary tests below dispatch to a dedicated 32-deep fixture's
         // "deep-target" print object rather than the root's "direct-root"
@@ -809,7 +811,7 @@ private:
 
     static String makeFixturePatch()
     {
-        return "#N canvas 100 100 300 200 12;\n#X obj 20 20 print direct-root;\n#X text 20 50 comment;\n#N canvas 0 0 300 200 nested 0;\n#X obj 20 20 print direct-nested;\n#X restore 100 100 pd nested;\n";
+        return "#N canvas 100 100 300 200 12;\n#X obj 20 20 print direct-root;\n#X text 20 50 comment;\n#N canvas 0 0 300 200 nested 0;\n#X obj 20 20 print direct-nested;\n#X restore 100 100 pd nested;\n#X msg 20 80 content-from-box;\n#X obj 20 110 print direct-root;\n#X connect 3 0 4 0;\n";
     }
 
     // Builds a patch with `depth` levels of nesting, each the ordinal-0 child

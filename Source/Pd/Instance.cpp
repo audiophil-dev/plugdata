@@ -1806,7 +1806,7 @@ void Instance::handleDebugMessage(Message const& message)
                         object = object->g_next;
                     if (!object)
                         runtimeError = "ObjectNotFound";
-                    else if (auto* resolvedObject = pd::Interface::checkObject(&object->g_pd); !resolvedObject || resolvedObject->te_type != T_OBJECT)
+                    else if (auto* resolvedObject = pd::Interface::checkObject(&object->g_pd); !resolvedObject || (resolvedObject->te_type != T_OBJECT && resolvedObject->te_type != T_MESSAGE))
                         runtimeError = "ObjectTypeMismatch";
                     else {
                         SmallArray<Atom> resolvedAtoms;
