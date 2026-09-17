@@ -204,6 +204,26 @@ No new network listener is added by this fork. A separate, independently
 reviewed `pd-mcp` integration plan may later route external tool traffic
 through these receivers; that integration is out of scope here.
 
+### Build flavors and managed use
+
+Two build flavors serve different purposes:
+
+- `ENABLE_TESTING=OFF` (default): normal application behavior. Settings persist
+  in `Documents/plugdata/settings.json`, so state such as `onboarding_completed`
+  survives across launches.
+- `ENABLE_TESTING=1`: for running the test suite, which launches only when the
+  `PLUGDATA_RUN_TESTS=1` environment variable is set; without it the binary
+  starts as a normal application. In this flavor, `SettingsFile` substitutes a
+  fresh temporary file for `settings.json` on every launch, so every settings
+  write is discarded when the process exits.
+
+Managed tooling that drives the debug API across sessions should use an
+`ENABLE_TESTING=OFF` build, because in a test build no setting (including
+`onboarding_completed`) persists and the onboarding dialog reappears on every
+launch. Use the test build only for suite runs. A managed launcher that
+redirects `HOME` should also account for plugdata's app data directory being
+`$HOME/Documents/plugdata`.
+
 ### Licensing note for this fork
 
 This repository is a fork of plugdata with source-level modifications
