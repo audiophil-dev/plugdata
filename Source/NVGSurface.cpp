@@ -461,7 +461,7 @@ void NVGSurface::snapshotEditorSize()
     // Message thread only. Publishes the editor's logical size so the render thread
     // can size the drawable/framebuffer without touching the editor Component, whose
     // bounds are message-thread-only.
-    JUCE_ASSERT_MESSAGE_THREAD;
+    JUCE_ASSERT_MESSAGE_MANAGER_IS_LOCKED;
     editorWidth.store(jmax(1, editor->getWidth()), std::memory_order_relaxed);
     editorHeight.store(jmax(1, editor->getHeight()), std::memory_order_relaxed);
 }
@@ -685,16 +685,8 @@ void NVGSurface::recordFrame()
 
         nanovg::setCurrentPixelScale(asyncNvg, devicePixelScale);
 
-        for (auto bufferedObject : bufferedObjects) {
-            if (bufferedObject)
-                bufferedObject->updateFramebuffers(asyncNvg);
-        }
-
         // Render the damaged region into the persistent main framebuffer. The
-        // render thread owns that framebuffer; we just record "bind the main target"
-        // here. It must come AFTER updateFramebuffers, because buffered objects
-        // bind (and unbind to the default target) their own framebuffers while
-        // updating.
+        // render thread owns that framebuffer; we just record "bind the main target" here.
         nanovg::bindMainFramebuffer(asyncNvg);
         nanovg::viewport(asyncNvg, 0, 0, fbWidth, fbHeight);
 
@@ -862,16 +854,6 @@ NVGSurface* NVGSurface::getSurfaceForContext(NVGcontext* nvg)
     }
 
     return nullptr;
-}
-
-void NVGSurface::addBufferedObject(NVGComponent* component)
-{
-    bufferedObjects.insert(component);
-}
-
-void NVGSurface::removeBufferedObject(NVGComponent* component)
-{
-    bufferedObjects.erase(component);
 }
 
 void NVGSurface::CommandBufferCache::paint(Graphics& g)

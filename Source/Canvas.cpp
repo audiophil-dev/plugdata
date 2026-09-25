@@ -176,27 +176,7 @@ public:
         nanovg::nvgDrawRoundedRect(nvg, b.getX(), b.getY(), b.getWidth(), b.getHeight(), iCol, nvgColour(colours.objectSelectedOutlineColour), getPlugDataLook(*this).getObjectCornerRadius());
 
         // Draw handles at edge
-        auto getCorners = [this] {
-            auto const rect = getBounds().reduced(tabMargin);
-            constexpr float offset = 2.0f;
-
-            Array<Rectangle<float>> corners = { Rectangle<float>(9.0f, 9.0f).withCentre(rect.getTopLeft().toFloat()).translated(offset, offset), Rectangle<float>(9.0f, 9.0f).withCentre(rect.getBottomLeft().toFloat()).translated(offset, -offset),
-                Rectangle<float>(9.0f, 9.0f).withCentre(rect.getBottomRight().toFloat()).translated(-offset, -offset), Rectangle<float>(9.0f, 9.0f).withCentre(rect.getTopRight().toFloat()).translated(-offset, offset) };
-
-            return corners;
-        };
-
-        int angle = 360;
-        for (auto& corner : getCorners()) {
-            NVGScopedState scopedState(nvg);
-            // Rotate around centre
-            nanovg::nvgTranslate(nvg, corner.getCentreX(), corner.getCentreY());
-            nanovg::nvgRotate(nvg, degreesToRadians<float>(angle));
-            nanovg::nvgTranslate(nvg, -4.5f, -4.5f);
-
-            cnv->renderResizeHandle(nvg, nvgColour(colours.objectSelectedOutlineColour));
-            angle -= 90;
-        }
+        cnv->renderResizeHandles(nvg, nvgColour(colours.objectSelectedOutlineColour), b.toFloat().expanded(2.5f));
     }
 
 private:
@@ -320,10 +300,6 @@ Canvas::Canvas(PluginEditor* parent, pd::Patch::Ptr p, Component* parentGraph)
         graphArea->setAlwaysOnTop(true);
     }
 
-    if (!isGraph) {
-        editor->nvgSurface.addBufferedObject(this);
-    }
-
     // Add lasso component
     addAndMakeVisible(&lasso);
     lasso.setAlwaysOnTop(true);
@@ -376,10 +352,6 @@ Canvas::~Canvas()
         object->hideEditor();
     }
 
-    if (!isGraph) {
-        editor->nvgSurface.removeBufferedObject(this);
-    }
-
     saveViewportState();
     zoomScale.removeListener(this);
     editor->removeModifierKeyListener(this);
@@ -413,7 +385,8 @@ void Canvas::changeListenerCallback(ChangeBroadcaster* c)
 
 void Canvas::lookAndFeelChanged()
 {
-    dotsLargeImage.setDirty(); // Make sure bg colour actually gets updated
+    dotsLargeImage.setDirty();
+    resizeHandleImage.setDirty();
 }
 
 void Canvas::parentHierarchyChanged()
@@ -426,7 +399,7 @@ void Canvas::parentHierarchyChanged()
     }
 }
 
-void Canvas::updateFramebuffers(NVGcontext* nvg)
+void Canvas::updateCanvasDots(NVGcontext* nvg)
 {
     auto const pixelScale = editor->getRenderScale();
     auto zoom = getValue<float>(zoomScale);
@@ -449,7 +422,6 @@ void Canvas::updateFramebuffers(NVGcontext* nvg)
 
             nanovg::nvgFillColor(nvg, nvgColour(colours.canvasBackgroundColour));
             nanovg::nvgFillRect(nvg, 0, 0, gridSizeCommon, gridSizeCommon);
-
 
             float const ellipseRadius = zoom < 1.0f ? jmap(zoom, 0.25f, 1.0f, 3.0f, 1.0f) : 1.0f;
 
@@ -516,38 +488,60 @@ void Canvas::updateFramebuffers(NVGcontext* nvg)
     }
 }
 
-void Canvas::renderResizeHandle(NVGcontext* nvg, NVGcolor const colour)
+void Canvas::renderResizeHandles(NVGcontext* nvg, NVGcolor const colour, Rectangle<float> const bounds)
 {
-    nanovg::nvgFillColor(nvg, colour);
+    auto constexpr resizeHandleSize = 9.0f;
+    auto constexpr resizeHandleMargin = 1.0f;
+    auto constexpr resizeHandleImageSize = resizeHandleSize + resizeHandleMargin * 2.0f;
 
-    if (!resizeHandlePath.fill()) {
-        constexpr float resizerLogicalSize = 9.0f;
+    auto const scale = getValue<float>(zoomScale) * editor->getRenderScale();
+    auto const pixelSize = jlimit(8, 256, nextPowerOfTwo(static_cast<int>(std::ceil(resizeHandleImageSize * scale))));
+
+    if (resizeHandleImage.needsUpdate(pixelSize, pixelSize)) {
         constexpr float kappa = 0.5522847498307936f;
         auto const innerOffset = static_cast<float>(Object::margin) / 2.0f;
-        auto const outerRadius = jlimit(0.0f, resizerLogicalSize * 0.5f, Corners::resizeHanleCornerRadius);
-        auto const innerRadius = jlimit(0.0f, resizerLogicalSize - innerOffset, getPlugDataLook(*this).getObjectCornerRadius());
+        auto const outerRadius = jlimit(0.0f, resizeHandleSize * 0.5f, Corners::resizeHanleCornerRadius);
+        auto const innerRadius = jlimit(0.0f, resizeHandleSize - innerOffset, getPlugDataLook(*this).getObjectCornerRadius());
         auto const outerControl = outerRadius * (1.0f - kappa);
         auto const innerControl = innerRadius * (1.0f - kappa);
 
-        nanovg::nvgBeginPath(nvg);
-        nanovg::nvgMoveTo(nvg, outerRadius, 0.0f);
-        nanovg::nvgLineTo(nvg, resizerLogicalSize - outerRadius, 0.0f);
-        nanovg::nvgBezierTo(nvg, resizerLogicalSize - outerControl, 0.0f, resizerLogicalSize, outerControl, resizerLogicalSize, outerRadius);
-        nanovg::nvgLineTo(nvg, resizerLogicalSize, innerOffset);
-        nanovg::nvgLineTo(nvg, innerOffset + innerRadius, innerOffset);
+        Path handleShape;
+        handleShape.startNewSubPath(outerRadius, 0.0f);
+        handleShape.lineTo(resizeHandleSize - outerRadius, 0.0f);
+        handleShape.cubicTo(resizeHandleSize - outerControl, 0.0f, resizeHandleSize, outerControl, resizeHandleSize, outerRadius);
+        handleShape.lineTo(resizeHandleSize, innerOffset);
+        handleShape.lineTo(innerOffset + innerRadius, innerOffset);
         if (innerRadius > 0.0f) {
-            nanovg::nvgBezierTo(nvg, innerOffset + innerControl, innerOffset, innerOffset, innerOffset + innerControl, innerOffset, innerOffset + innerRadius);
+            handleShape.cubicTo(innerOffset + innerControl, innerOffset, innerOffset, innerOffset + innerControl, innerOffset, innerOffset + innerRadius);
         } else {
-            nanovg::nvgLineTo(nvg, innerOffset, innerOffset);
+            handleShape.lineTo(innerOffset, innerOffset);
         }
-        nanovg::nvgLineTo(nvg, innerOffset, resizerLogicalSize);
-        nanovg::nvgLineTo(nvg, outerRadius, resizerLogicalSize);
-        nanovg::nvgBezierTo(nvg, outerControl, resizerLogicalSize, 0.0f, resizerLogicalSize - outerControl, 0.0f, resizerLogicalSize - outerRadius);
-        nanovg::nvgLineTo(nvg, 0.0f, outerRadius);
-        nanovg::nvgBezierTo(nvg, 0.0f, outerControl, outerControl, 0.0f, outerRadius, 0.0f);
-        nanovg::nvgClosePath(nvg);
-        nanovg::nvgFill(nvg);
-        resizeHandlePath.save(nvg);
+        handleShape.lineTo(innerOffset, resizeHandleSize);
+        handleShape.lineTo(outerRadius, resizeHandleSize);
+        handleShape.cubicTo(outerControl, resizeHandleSize, 0.0f, resizeHandleSize - outerControl, 0.0f, resizeHandleSize - outerRadius);
+        handleShape.lineTo(0.0f, outerRadius);
+        handleShape.cubicTo(0.0f, outerControl, outerControl, 0.0f, outerRadius, 0.0f);
+        handleShape.closeSubPath();
+
+        resizeHandleImage = NVGImage(nvg, pixelSize, pixelSize, [handleShape, pixelSize](Graphics& g) {
+            g.setColour(Colours::white);
+            g.fillPath(handleShape, AffineTransform::translation(resizeHandleMargin, resizeHandleMargin).scaled(pixelSize / resizeHandleImageSize));
+        }, NVGImage::AlphaImage);
+    }
+
+    if (!resizeHandleImage.isValid())
+        return;
+    
+    auto const imageId = resizeHandleImage.getImageId();
+    NVGScopedState scopedState(nvg);
+    for (int i = 0; i < 4; i++) {
+        bool const isRight = i == 1 || i == 2;
+        bool const isBottom = i >= 2;
+        auto const x = isRight ? bounds.getRight() + resizeHandleMargin : bounds.getX() - resizeHandleMargin;
+        auto const y = isBottom ? bounds.getBottom() + resizeHandleMargin : bounds.getY() - resizeHandleMargin;
+
+        nanovg::nvgFillPaint(nvg, nanovg::nvgImageAlphaPattern(nvg, x, y, resizeHandleImageSize, resizeHandleImageSize, i * MathConstants<float>::halfPi, imageId, colour));
+        nanovg::nvgFillRect(nvg, isRight ? x - resizeHandleImageSize : x, isBottom ? y - resizeHandleImageSize : y, resizeHandleImageSize, resizeHandleImageSize);
     }
 }
 
@@ -577,6 +571,8 @@ void Canvas::performRender(NVGcontext* nvg, Rectangle<int> invalidRegion)
             // But currently 300 works well on GPU.
             {
                 constexpr auto gridSizeCommon = 300;
+                updateCanvasDots(nvg);
+
                 NVGScopedState scopedState(nvg);
                 // offset image texture by 2.5f so no dots are on the edge of the texture
                 nanovg::nvgTranslate(nvg, canvasOrigin.x - 2.5f, canvasOrigin.x - 2.5f);
@@ -1505,6 +1501,9 @@ void Canvas::updateSidebarSelection()
 
         if (auto* s = editor->getSidebarForPanel(Sidebar::InspectorPanel))
             s->showParameters(toShow, allParameters, showOnSelect);
+
+        if (auto* s = editor->getSidebarForPanel(Sidebar::ObjectReferencePanel))
+            s->updateReference(lassoSelection.size() == 1 ? lassoSelection[0]->getType().toString() : String());
     });
 }
 
@@ -2787,7 +2786,7 @@ void Canvas::receiveMessage(t_symbol* symbol, SmallArray<pd::Atom> const& atoms)
                     _this->setSelected(object, false);
                     if (auto* s = _this->editor->getSidebarForPanel(Sidebar::InspectorPanel))
                         s->hideParameters();
-                    object->setType(object->gui->getText(), object->gui->ptr);
+                    object->setType(object->gui->getText().toString(), object->gui->ptr);
                 }
             });
         }

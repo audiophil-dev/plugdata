@@ -64,7 +64,7 @@ private:
             return;
         }
 
-        beginTest("Inspect [" + obj->gui->getType() + "]");
+        beginTest("Inspect [" + obj->gui->getType().toString() + "]");
 
         // The normal path: selection change posts the parameters to the sidebar
         cnv->deselectAll();
@@ -133,7 +133,6 @@ private:
 
     void finish()
     {
-        ColourPicker::getInstance()->clearSingletonInstance();
         if (auto* sidebar = editor->getSidebarForPanel(Sidebar::InspectorPanel))
             sidebar->clearInspector();
 
