@@ -5,6 +5,7 @@
  */
 
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <juce_cryptography/juce_cryptography.h>
 
 #include "Utility/Config.h"
 #include "Utility/Fonts.h"
@@ -13,9 +14,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 #include "Instance.h"
 #include "Object.h"
+#include "Connection.h"
 #include "Patch.h"
 #include "MessageListener.h"
 #include "Objects/ImplementationBase.h"
@@ -44,7 +49,14 @@ constexpr int maxDecodedDebugRequestBytes = 48 * 1024;
 constexpr int maxEncodedDebugResponseBytes = 60 * 1024;
 constexpr int maxGenerationBytes = 128;
 constexpr int maxRootReceiverBytes = 128;
-
+#if ENABLE_TESTING
+void (*canvasEditInterleaveHookForTesting)(void*) = nullptr;
+void* canvasEditInterleaveContextForTesting = nullptr;
+void (*canvasEditFailureHookForTesting)(void*) = nullptr;
+void* canvasEditFailureContextForTesting = nullptr;
+void (*canvasEditGuiMismatchHookForTesting)(void*) = nullptr;
+void* canvasEditGuiMismatchContextForTesting = nullptr;
+#endif
 var makeDebugError(int const requestId, String const& code, String const& message)
 {
     auto* error = new DynamicObject();
@@ -251,6 +263,1317 @@ bool hasOnlyExportCanvasFields(DynamicObject const& request)
     }
 
     return sawVersion && sawRequestId && sawOperation && sawGeneration && sawPath;
+}
+
+bool hasFields(DynamicObject const& object, std::initializer_list<char const*> required, std::initializer_list<char const*> optional = {})
+{
+    auto const& properties = object.getProperties();
+    if (properties.size() < static_cast<int>(required.size()) || properties.size() > static_cast<int>(required.size() + optional.size()))
+        return false;
+    for (auto const* field : required)
+        if (!object.hasProperty(field))
+            return false;
+    for (auto const& [name, value] : properties) {
+        ignoreUnused(value);
+        bool known = false;
+        for (auto const* field : required)
+            known |= name.toString() == field;
+        for (auto const* field : optional)
+            known |= name.toString() == field;
+        if (!known)
+            return false;
+    }
+    return true;
+}
+
+bool boundedString(var const& value, int const maxBytes)
+{
+    return value.isString() && value.toString().isNotEmpty() && value.toString().getNumBytesAsUTF8() <= maxBytes;
+}
+
+var makeCanvasPage(int requestId, String const& revision, Array<var> const& records, var const& nextCursor);
+
+bool nonnegativeOrdinal(var const& value)
+{
+    return (value.isInt() || value.isInt64()) && static_cast<int64>(value) >= 0 && static_cast<int64>(value) <= INT_MAX;
+}
+
+bool boundedCoordinate(var const& value)
+{
+    return (value.isInt() || value.isInt64()) && static_cast<int64>(value) >= -1000000 && static_cast<int64>(value) <= 1000000;
+}
+
+bool batchTarget(var const& value, StringArray const& refs)
+{
+    if (nonnegativeOrdinal(value))
+        return true;
+    auto* target = value.getDynamicObject();
+    return target && hasFields(*target, { "ref" }) && boundedString(target->getProperty("ref"), 128)
+        && refs.contains(target->getProperty("ref").toString());
+}
+
+bool canvasPathValid(var const& value, StringArray const& subpatchRefs, bool const allowRefs)
+{
+    auto const* path = value.getArray();
+    if (!path || path->size() > 32)
+        return false;
+    for (auto const& component : *path) {
+        if (nonnegativeOrdinal(component))
+            continue;
+        if (!allowRefs || !batchTarget(component, subpatchRefs))
+            return false;
+    }
+    return true;
+}
+
+bool canvasRequestValid(DynamicObject const& request, bool const edit)
+{
+    auto const generation = request.getProperty("generation");
+    if (!boundedString(generation, maxGenerationBytes))
+        return false;
+
+    if (!edit) {
+        if (!hasFields(request, { "version", "request_id", "operation", "generation", "canvas_path" }, { "cursor", "expected_revision" })
+            || !canvasPathValid(request.getProperty("canvas_path"), {}, false)
+            || (request.hasProperty("cursor") && !request.hasProperty("expected_revision")))
+            return false;
+        for (auto const* field : { "cursor", "expected_revision" })
+            if (request.hasProperty(field) && !boundedString(request.getProperty(field), 128))
+                return false;
+        return true;
+    }
+
+    if (!hasFields(request, { "version", "request_id", "operation", "generation", "expected_revision", "edits" })
+        || !boundedString(request.getProperty("expected_revision"), 128))
+        return false;
+    auto const editsValue = request.getProperty("edits");
+    auto const* edits = editsValue.getArray();
+    if (!edits || edits->isEmpty() || edits->size() > 100)
+        return false;
+
+    StringArray createdRefs, liveRefs, subpatchRefs;
+    for (auto const& entry : *edits) {
+        auto* editObject = entry.getDynamicObject();
+        if (!editObject || !boundedString(editObject->getProperty("op"), 16)
+            || !canvasPathValid(editObject->getProperty("canvas_path"), subpatchRefs, true))
+            return false;
+        String const op = editObject->getProperty("op").toString();
+        if (op == "add") {
+            if (!hasFields(*editObject, { "op", "canvas_path", "ref", "type", "x", "y" }, { "text", "name" })
+                || !boundedString(editObject->getProperty("ref"), 128)
+                || createdRefs.contains(editObject->getProperty("ref").toString())
+                || !boundedCoordinate(editObject->getProperty("x")) || !boundedCoordinate(editObject->getProperty("y")))
+                return false;
+            String const type = editObject->getProperty("type").toString();
+            if (type == "subpatch") {
+                if (editObject->hasProperty("text") || !boundedString(editObject->getProperty("name"), 128))
+                    return false;
+                subpatchRefs.add(editObject->getProperty("ref").toString());
+            } else if ((type != "object" && type != "comment") || editObject->hasProperty("name")
+                || !boundedString(editObject->getProperty("text"), 2048)) {
+                return false;
+            }
+            createdRefs.add(editObject->getProperty("ref").toString());
+            liveRefs.add(editObject->getProperty("ref").toString());
+        } else if (op == "move") {
+            if (!hasFields(*editObject, { "op", "canvas_path", "target", "x", "y" })
+                || !batchTarget(editObject->getProperty("target"), liveRefs)
+                || !boundedCoordinate(editObject->getProperty("x")) || !boundedCoordinate(editObject->getProperty("y")))
+                return false;
+        } else if (op == "remove") {
+            if (!hasFields(*editObject, { "op", "canvas_path", "target" }) || !batchTarget(editObject->getProperty("target"), liveRefs))
+                return false;
+            auto const targetValue = editObject->getProperty("target");
+            auto* target = targetValue.getDynamicObject();
+            if (target) {
+                String const ref = target->getProperty("ref").toString();
+                liveRefs.removeString(ref);
+                subpatchRefs.removeString(ref);
+            }
+        } else if (op == "connect" || op == "disconnect") {
+            if (!hasFields(*editObject, { "op", "canvas_path", "source", "outlet", "target", "inlet" })
+                || !batchTarget(editObject->getProperty("source"), liveRefs)
+                || !batchTarget(editObject->getProperty("target"), liveRefs)
+                || !nonnegativeOrdinal(editObject->getProperty("outlet")) || !nonnegativeOrdinal(editObject->getProperty("inlet")))
+                return false;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+void appendCanvasRecords(t_canvas* canvas, Array<var> const& path, Array<var>& records)
+{
+    auto* canvasRecord = new DynamicObject();
+    canvasRecord->setProperty("kind", "canvas");
+    canvasRecord->setProperty("canvas_path", var(path));
+    canvasRecord->setProperty("name", String::fromUTF8(canvas->gl_name->s_name));
+    records.add(var(canvasRecord));
+
+    int ordinal = 0;
+    for (auto* object = canvas->gl_list; object; object = object->g_next, ++ordinal) {
+        auto* record = new DynamicObject();
+        record->setProperty("kind", "object");
+        record->setProperty("canvas_path", var(path));
+        record->setProperty("ordinal", ordinal);
+        if (pd_class(&object->g_pd) == canvas_class) {
+            record->setProperty("type", "subpatch");
+            record->setProperty("name", String::fromUTF8(reinterpret_cast<t_canvas*>(object)->gl_name->s_name));
+        } else if (auto* text = Interface::checkObject(object)) {
+            record->setProperty("type", text->te_type == T_TEXT ? "comment" : text->te_type == T_MESSAGE ? "message" : text->te_type == T_ATOM ? "atom" : "object");
+            record->setProperty("text", Interface::getObjectText(text).toString());
+        } else {
+            record->setProperty("type", String::fromUTF8(class_getname(pd_class(&object->g_pd))));
+            auto* definition = binbuf_new();
+            gobj_save(object, definition);
+            char* bytes = nullptr;
+            int size = 0;
+            binbuf_gettext(definition, &bytes, &size);
+            record->setProperty("definition", String::fromUTF8(bytes, size));
+            freebytes(bytes, static_cast<size_t>(size));
+            binbuf_free(definition);
+        }
+        if (auto* text = Interface::checkObject(object)) {
+            record->setProperty("x", text->te_xpix);
+            record->setProperty("y", text->te_ypix);
+        } else if (pd_class(&object->g_pd) == scalar_class) {
+            t_float x = 0, y = 0;
+            auto* scalar = reinterpret_cast<t_scalar*>(object);
+            scalar_getbasexy(scalar, &x, &y);
+            record->setProperty("template", String::fromUTF8(scalar->sc_template->s_name));
+            record->setProperty("x", static_cast<double>(x));
+            record->setProperty("y", static_cast<double>(y));
+            record->setProperty("coordinate_space", "data");
+        } else {
+            record->setProperty("position_available", false);
+        }
+        records.add(var(record));
+    }
+
+    t_linetraverser traversal;
+    linetraverser_start(&traversal, canvas);
+    while (linetraverser_next_nosize(&traversal)) {
+        auto* record = new DynamicObject();
+        record->setProperty("kind", "connection");
+        record->setProperty("canvas_path", var(path));
+        record->setProperty("source", canvas_getindex(canvas, &traversal.tr_ob->ob_g));
+        record->setProperty("outlet", traversal.tr_outno);
+        record->setProperty("target", canvas_getindex(canvas, &traversal.tr_ob2->ob_g));
+        record->setProperty("inlet", traversal.tr_inno);
+        if (traversal.outconnect_path_info != gensym("empty"))
+            record->setProperty("path_info", String::fromUTF8(traversal.outconnect_path_info->s_name));
+        records.add(var(record));
+    }
+
+    ordinal = 0;
+    for (auto* object = canvas->gl_list; object; object = object->g_next, ++ordinal)
+        if (pd_class(&object->g_pd) == canvas_class) {
+            auto childPath = path;
+            childPath.add(ordinal);
+            appendCanvasRecords(reinterpret_cast<t_canvas*>(object), childPath, records);
+    }
+}
+
+bool canvasIsInRoot(t_canvas* root, t_canvas* target)
+{
+    if (root == target)
+        return true;
+    for (auto* object = root->gl_list; object; object = object->g_next)
+        if (pd_class(&object->g_pd) == canvas_class
+            && canvasIsInRoot(reinterpret_cast<t_canvas*>(object), target))
+            return true;
+    return false;
+}
+
+bool canvasGuiMatchesPd(Canvas* canvas)
+{
+    auto* native = canvas->patch.getRawPointer();
+    if (!native || canvas->objects.size() != [&] {
+            int count = 0;
+            for (auto* object = native->gl_list; object; object = object->g_next)
+                ++count;
+            return count;
+        }())
+        return false;
+
+    int ordinal = 0;
+    for (auto* object = native->gl_list; object; object = object->g_next, ++ordinal) {
+        auto* shown = canvas->objects[ordinal];
+        if (!shown || shown->getPointer() != object)
+            return false;
+        if (canvas->isGraph && !shown->isVisible())
+            continue;
+        if (Interface::checkObject(object)) {
+            int x = 0, y = 0, width = 0, height = 0;
+            Interface::getObjectBounds(native, object, &x, &y, &width, &height);
+            if (shown->getObjectBounds().getPosition() != Point<int>(x, y))
+                return false;
+        }
+    }
+
+    if (canvas->isGraph)
+        return canvas->connections.size() == 0;
+
+    int connectionCount = 0;
+    t_linetraverser traversal;
+    linetraverser_start(&traversal, native);
+    while (auto* nativeConnection = linetraverser_next_nosize(&traversal)) {
+        bool found = false;
+        for (auto* shown : canvas->connections)
+            if (shown && shown->getPointer() == nativeConnection
+                && shown->outobj && shown->outobj->getPointer() == &traversal.tr_ob->ob_g
+                && shown->inobj && shown->inobj->getPointer() == &traversal.tr_ob2->ob_g
+                && shown->outIdx == traversal.tr_outno && shown->inIdx == traversal.tr_inno) {
+                found = true;
+                break;
+            }
+        if (!found)
+            return false;
+        ++connectionCount;
+    }
+    return canvas->connections.size() == connectionCount;
+}
+
+struct ProjectedCanvasConnection {
+    int source;
+    int outlet;
+    int target;
+    int inlet;
+};
+
+struct ProjectedCanvasObject {
+    t_object* pdObject = nullptr;
+    int canvasIndex = -1;
+    int childCanvasIndex = -1;
+    bool isSubpatch = false;
+    bool preState = true;
+    bool active = true;
+    bool portsKnown = true;
+    int inletCount = 0;
+    int outletCount = 0;
+    int parentPortIndex = -1;
+    std::vector<bool> signalInlets;
+    std::vector<bool> signalOutlets;
+};
+
+struct ProjectedCanvas {
+    t_canvas* pdCanvas = nullptr;
+    bool active = true;
+    std::vector<int> preStateObjects;
+    std::vector<int> projectedObjects;
+    std::vector<ProjectedCanvasConnection> connections;
+};
+
+bool preflightCanvasEdits(t_canvas* root, Array<var> const& edits, String& error, std::vector<t_canvas*>& removedSubpatches)
+{
+    std::vector<ProjectedCanvas> canvases;
+    std::vector<ProjectedCanvasObject> objects;
+    std::vector<int> movedPortParents;
+    StringArray refs;
+    std::vector<int> refObjects;
+    removedSubpatches.clear();
+
+    auto addCanvas = [&](auto&& self, t_canvas* canvas) -> int {
+        int const canvasIndex = static_cast<int>(canvases.size());
+        canvases.emplace_back();
+        canvases[static_cast<size_t>(canvasIndex)].pdCanvas = canvas;
+
+        for (auto* item = canvas->gl_list; item; item = item->g_next) {
+            bool const isSubpatch = pd_class(&item->g_pd) == canvas_class;
+            auto* pdObject = isSubpatch
+                ? &reinterpret_cast<t_canvas*>(item)->gl_obj
+                : Interface::checkObject(item);
+            ProjectedCanvasObject projectedObject;
+            projectedObject.pdObject = pdObject;
+            projectedObject.canvasIndex = canvasIndex;
+            projectedObject.isSubpatch = isSubpatch;
+            if (pdObject) {
+                projectedObject.inletCount = Interface::numInlets(pdObject);
+                projectedObject.outletCount = Interface::numOutlets(pdObject);
+                for (int inlet = 0; inlet < projectedObject.inletCount; ++inlet)
+                    projectedObject.signalInlets.push_back(Interface::isSignalInlet(pdObject, inlet));
+                for (int outlet = 0; outlet < projectedObject.outletCount; ++outlet)
+                    projectedObject.signalOutlets.push_back(Interface::isSignalOutlet(pdObject, outlet));
+            }
+            int const objectIndex = static_cast<int>(objects.size());
+            objects.push_back(projectedObject);
+            auto& projectedCanvas = canvases[static_cast<size_t>(canvasIndex)];
+            projectedCanvas.preStateObjects.push_back(objectIndex);
+            projectedCanvas.projectedObjects.push_back(objectIndex);
+
+            if (isSubpatch) {
+                int const childIndex = self(self, reinterpret_cast<t_canvas*>(item));
+                objects[static_cast<size_t>(objectIndex)].childCanvasIndex = childIndex;
+            }
+        }
+        return canvasIndex;
+    };
+
+    addCanvas(addCanvas, root);
+
+    for (auto const& owner : objects) {
+        if (owner.childCanvasIndex < 0)
+            continue;
+        auto const& child = canvases[static_cast<size_t>(owner.childCanvasIndex)];
+        for (auto* portClass : { vinlet_class, voutlet_class }) {
+            std::vector<int> ports;
+            for (auto const objectIndex : child.preStateObjects) {
+                auto* port = objects[static_cast<size_t>(objectIndex)].pdObject;
+                if (port && pd_class(&port->ob_pd) == portClass)
+                    ports.push_back(objectIndex);
+            }
+            std::sort(ports.begin(), ports.end(), [&](int left, int right) {
+                int const leftX = objects[static_cast<size_t>(left)].pdObject->te_xpix;
+                int const rightX = objects[static_cast<size_t>(right)].pdObject->te_xpix;
+                return leftX == rightX ? left > right : leftX < rightX;
+            });
+            for (int index = 0; index < static_cast<int>(ports.size()); ++index)
+                objects[static_cast<size_t>(ports[static_cast<size_t>(index)])].parentPortIndex = index;
+        }
+    }
+
+    for (int canvasIndex = 0; canvasIndex < static_cast<int>(canvases.size()); ++canvasIndex) {
+        auto* canvas = canvases[static_cast<size_t>(canvasIndex)].pdCanvas;
+        t_linetraverser traversal;
+        linetraverser_start(&traversal, canvas);
+        while (linetraverser_next_nosize(&traversal)) {
+            int const sourceOrdinal = canvas_getindex(canvas, &traversal.tr_ob->ob_g);
+            int const targetOrdinal = canvas_getindex(canvas, &traversal.tr_ob2->ob_g);
+            auto const& preState = canvases[static_cast<size_t>(canvasIndex)].preStateObjects;
+            if (sourceOrdinal < 0 || targetOrdinal < 0
+                || sourceOrdinal >= static_cast<int>(preState.size()) || targetOrdinal >= static_cast<int>(preState.size())) {
+                error = "InvalidConnection";
+                return false;
+            }
+            canvases[static_cast<size_t>(canvasIndex)].connections.push_back({
+                preState[static_cast<size_t>(sourceOrdinal)], traversal.tr_outno,
+                preState[static_cast<size_t>(targetOrdinal)], traversal.tr_inno });
+        }
+    }
+
+    auto findRef = [&](var const& value) {
+        auto* ref = value.getDynamicObject();
+        return ref ? refs.indexOf(ref->getProperty("ref").toString()) : -1;
+    };
+
+    auto resolveCanvas = [&](var const& pathValue) {
+        auto const* path = pathValue.getArray();
+        int canvasIndex = 0;
+        for (auto const& component : *path) {
+            int objectIndex = -1;
+            if (nonnegativeOrdinal(component)) {
+                auto const ordinal = static_cast<int>(component);
+                auto const& preState = canvases[static_cast<size_t>(canvasIndex)].preStateObjects;
+                if (ordinal >= static_cast<int>(preState.size())) {
+                    error = "CanvasNotFound";
+                    return -1;
+                }
+                objectIndex = preState[static_cast<size_t>(ordinal)];
+            } else {
+                int const refIndex = findRef(component);
+                if (refIndex >= 0)
+                    objectIndex = refObjects[static_cast<size_t>(refIndex)];
+            }
+
+            if (objectIndex < 0 || !objects[static_cast<size_t>(objectIndex)].active
+                || objects[static_cast<size_t>(objectIndex)].canvasIndex != canvasIndex) {
+                error = "CanvasNotFound";
+                return -1;
+            }
+            if (!objects[static_cast<size_t>(objectIndex)].isSubpatch) {
+                error = "CanvasTypeMismatch";
+                return -1;
+            }
+            if (objects[static_cast<size_t>(objectIndex)].childCanvasIndex < 0) {
+                error = "CanvasNotFound";
+                return -1;
+            }
+            canvasIndex = objects[static_cast<size_t>(objectIndex)].childCanvasIndex;
+            if (!canvases[static_cast<size_t>(canvasIndex)].active) {
+                error = "CanvasNotFound";
+                return -1;
+            }
+        }
+        return canvasIndex;
+    };
+
+    auto resolveTarget = [&](var const& value, int canvasIndex, bool allowOtherCanvas) {
+        int objectIndex = -1;
+        if (nonnegativeOrdinal(value)) {
+            int const ordinal = static_cast<int>(value);
+            auto const& preState = canvases[static_cast<size_t>(canvasIndex)].preStateObjects;
+            if (ordinal < static_cast<int>(preState.size()))
+                objectIndex = preState[static_cast<size_t>(ordinal)];
+        } else {
+            int const refIndex = findRef(value);
+            if (refIndex >= 0)
+                objectIndex = refObjects[static_cast<size_t>(refIndex)];
+        }
+        if (objectIndex < 0 || !objects[static_cast<size_t>(objectIndex)].active
+            || (!allowOtherCanvas && objects[static_cast<size_t>(objectIndex)].canvasIndex != canvasIndex)) {
+            error = "ObjectNotFound";
+            return -1;
+        }
+        return objectIndex;
+    };
+
+    auto deactivateCanvas = [&](auto&& self, int canvasIndex) -> void {
+        auto& canvas = canvases[static_cast<size_t>(canvasIndex)];
+        if (!canvas.active)
+            return;
+        canvas.active = false;
+        for (auto const objectIndex : canvas.projectedObjects) {
+            auto& object = objects[static_cast<size_t>(objectIndex)];
+            if (!object.active)
+                continue;
+            object.active = false;
+            if (object.childCanvasIndex >= 0)
+                self(self, object.childCanvasIndex);
+        }
+        canvas.projectedObjects.clear();
+        canvas.connections.clear();
+    };
+
+    auto collectSubpatchCanvases = [&](int const firstCanvasIndex) {
+        std::vector<int> pendingCanvasIndices { firstCanvasIndex };
+        while (!pendingCanvasIndices.empty()) {
+            int const canvasIndex = pendingCanvasIndices.back();
+            pendingCanvasIndices.pop_back();
+            auto const& canvas = canvases[static_cast<size_t>(canvasIndex)];
+            if (canvas.pdCanvas && std::find(removedSubpatches.begin(), removedSubpatches.end(), canvas.pdCanvas) == removedSubpatches.end())
+                removedSubpatches.push_back(canvas.pdCanvas);
+            for (auto const objectIndex : canvas.preStateObjects) {
+                auto const& object = objects[static_cast<size_t>(objectIndex)];
+                if (object.isSubpatch && object.childCanvasIndex >= 0)
+                    pendingCanvasIndices.push_back(object.childCanvasIndex);
+            }
+        }
+    };
+
+    auto validatePorts = [&](int sourceIndex, int outlet, int targetIndex, int inlet, bool checkSignalCompatibility) {
+        auto const& source = objects[static_cast<size_t>(sourceIndex)];
+        auto const& target = objects[static_cast<size_t>(targetIndex)];
+        if ((source.portsKnown && outlet >= source.outletCount)
+            || (target.portsKnown && inlet >= target.inletCount)) {
+            error = "InvalidPort";
+            return false;
+        }
+        if (checkSignalCompatibility && source.portsKnown && target.portsKnown
+            && source.signalOutlets[static_cast<size_t>(outlet)] && !target.signalInlets[static_cast<size_t>(inlet)]) {
+            error = "InvalidConnection";
+            return false;
+        }
+        return true;
+    };
+
+    auto hasConnection = [](std::vector<ProjectedCanvasConnection> const& connections, int source, int outlet, int target, int inlet) {
+        return std::any_of(connections.begin(), connections.end(), [&](ProjectedCanvasConnection const& connection) {
+            return connection.source == source && connection.outlet == outlet
+                && connection.target == target && connection.inlet == inlet;
+        });
+    };
+
+    for (auto const& editValue : edits) {
+        auto* edit = editValue.getDynamicObject();
+        int const canvasIndex = resolveCanvas(edit->getProperty("canvas_path"));
+        if (canvasIndex < 0)
+            return false;
+
+        String const op = edit->getProperty("op").toString();
+        if (op == "add") {
+            String const ref = edit->getProperty("ref").toString();
+            String const type = edit->getProperty("type").toString();
+            if (type == "object" && canvasIndex != 0) {
+                for (auto& object : objects)
+                    if (object.childCanvasIndex == canvasIndex)
+                        object.portsKnown = false;
+            }
+            if (type == "object") {
+                auto* words = binbuf_new();
+                auto const text = edit->getProperty("text").toString();
+                binbuf_text(words, text.toRawUTF8(), text.getNumBytesAsUTF8());
+                bool const createsSubpatch = binbuf_getnatom(words) > 0
+                    && binbuf_getvec(words)[0].a_type == A_SYMBOL
+                    && atom_getsymbol(binbuf_getvec(words)) == gensym("pd");
+                binbuf_free(words);
+                if (createsSubpatch) {
+                    error = "InvalidRequest";
+                    return false;
+                }
+            }
+            bool const isSubpatch = type == "subpatch";
+            ProjectedCanvasObject object;
+            object.canvasIndex = canvasIndex;
+            object.isSubpatch = isSubpatch;
+            object.preState = false;
+            object.portsKnown = type == "comment";
+            int const objectIndex = static_cast<int>(objects.size());
+            objects.push_back(object);
+            canvases[static_cast<size_t>(canvasIndex)].projectedObjects.push_back(objectIndex);
+            refs.add(ref);
+            refObjects.push_back(objectIndex);
+            if (isSubpatch) {
+                int const childIndex = static_cast<int>(canvases.size());
+                canvases.emplace_back();
+                objects[static_cast<size_t>(objectIndex)].childCanvasIndex = childIndex;
+            }
+            continue;
+        }
+
+        if (op == "move") {
+            int const objectIndex = resolveTarget(edit->getProperty("target"), canvasIndex, false);
+            if (objectIndex < 0)
+                return false;
+            auto const& object = objects[static_cast<size_t>(objectIndex)];
+            if (object.isSubpatch || (object.preState && !object.pdObject)) {
+                error = "ObjectTypeMismatch";
+                return false;
+            }
+            if (object.pdObject && (pd_class(&object.pdObject->ob_pd) == vinlet_class
+                    || pd_class(&object.pdObject->ob_pd) == voutlet_class)) {
+                for (int parentIndex = 0; parentIndex < static_cast<int>(objects.size()); ++parentIndex)
+                    if (objects[static_cast<size_t>(parentIndex)].active
+                        && objects[static_cast<size_t>(parentIndex)].childCanvasIndex == canvasIndex
+                        && std::find(movedPortParents.begin(), movedPortParents.end(), parentIndex) == movedPortParents.end())
+                        movedPortParents.push_back(parentIndex);
+            }
+            continue;
+        }
+
+        if (op == "remove") {
+            int const objectIndex = resolveTarget(edit->getProperty("target"), canvasIndex, false);
+            if (objectIndex < 0)
+                return false;
+            auto& canvas = canvases[static_cast<size_t>(canvasIndex)];
+            auto& object = objects[static_cast<size_t>(objectIndex)];
+            if (object.parentPortIndex >= 0 && std::any_of(objects.begin(), objects.end(), [&](auto const& parent) {
+                    return parent.active && parent.childCanvasIndex == canvasIndex
+                        && std::find(movedPortParents.begin(), movedPortParents.end(), &parent - objects.data()) != movedPortParents.end();
+                })) {
+                error = "InvalidConnection";
+                return false;
+            }
+            if (object.pdObject && object.parentPortIndex >= 0) {
+                bool const inletPort = pd_class(&object.pdObject->ob_pd) == vinlet_class;
+                for (auto& parent : objects) {
+                    if (!parent.active || parent.childCanvasIndex != canvasIndex)
+                        continue;
+                    auto& parentConnections = canvases[static_cast<size_t>(parent.canvasIndex)].connections;
+                    int const parentIndex = static_cast<int>(&parent - objects.data());
+                    parentConnections.erase(std::remove_if(parentConnections.begin(), parentConnections.end(), [&](auto const& connection) {
+                        return inletPort ? connection.target == parentIndex && connection.inlet == object.parentPortIndex
+                                         : connection.source == parentIndex && connection.outlet == object.parentPortIndex;
+                    }), parentConnections.end());
+                    for (auto& connection : parentConnections) {
+                        if (inletPort && connection.target == parentIndex && connection.inlet > object.parentPortIndex)
+                            --connection.inlet;
+                        if (!inletPort && connection.source == parentIndex && connection.outlet > object.parentPortIndex)
+                            --connection.outlet;
+                    }
+                    if (inletPort) {
+                        --parent.inletCount;
+                        parent.signalInlets.erase(parent.signalInlets.begin() + object.parentPortIndex);
+                    } else {
+                        --parent.outletCount;
+                        parent.signalOutlets.erase(parent.signalOutlets.begin() + object.parentPortIndex);
+                    }
+                    for (auto const siblingIndex : canvas.projectedObjects) {
+                        auto& sibling = objects[static_cast<size_t>(siblingIndex)];
+                        if (sibling.parentPortIndex > object.parentPortIndex
+                            && sibling.pdObject && pd_class(&sibling.pdObject->ob_pd) == pd_class(&object.pdObject->ob_pd))
+                            --sibling.parentPortIndex;
+                    }
+                    break;
+                }
+            }
+            if (object.preState && object.isSubpatch && object.childCanvasIndex >= 0)
+                collectSubpatchCanvases(object.childCanvasIndex);
+            object.active = false;
+            canvas.projectedObjects.erase(std::remove(canvas.projectedObjects.begin(), canvas.projectedObjects.end(), objectIndex),
+                canvas.projectedObjects.end());
+            canvas.connections.erase(std::remove_if(canvas.connections.begin(), canvas.connections.end(), [&](ProjectedCanvasConnection const& connection) {
+                return connection.source == objectIndex || connection.target == objectIndex;
+            }), canvas.connections.end());
+            if (object.childCanvasIndex >= 0)
+                deactivateCanvas(deactivateCanvas, object.childCanvasIndex);
+            continue;
+        }
+
+        int const sourceIndex = resolveTarget(edit->getProperty("source"), canvasIndex, true);
+        if (sourceIndex < 0)
+            return false;
+        int const targetIndex = resolveTarget(edit->getProperty("target"), canvasIndex, true);
+        if (targetIndex < 0)
+            return false;
+        if (objects[static_cast<size_t>(sourceIndex)].canvasIndex != canvasIndex
+            || objects[static_cast<size_t>(targetIndex)].canvasIndex != canvasIndex
+            || sourceIndex == targetIndex) {
+            error = "InvalidConnection";
+            return false;
+        }
+        if (std::find(movedPortParents.begin(), movedPortParents.end(), sourceIndex) != movedPortParents.end()
+            || std::find(movedPortParents.begin(), movedPortParents.end(), targetIndex) != movedPortParents.end()) {
+            error = "InvalidConnection";
+            return false;
+        }
+
+        int const outlet = static_cast<int>(edit->getProperty("outlet"));
+        int const inlet = static_cast<int>(edit->getProperty("inlet"));
+        if (!validatePorts(sourceIndex, outlet, targetIndex, inlet, op == "connect"))
+            return false;
+
+        auto& connections = canvases[static_cast<size_t>(canvasIndex)].connections;
+        bool const connected = hasConnection(connections, sourceIndex, outlet, targetIndex, inlet);
+        if (op == "connect") {
+            if (connected) {
+                error = "InvalidConnection";
+                return false;
+            }
+            connections.push_back({ sourceIndex, outlet, targetIndex, inlet });
+        } else {
+            if (!connected) {
+                error = "InvalidConnection";
+                return false;
+            }
+            connections.erase(std::remove_if(connections.begin(), connections.end(), [&](ProjectedCanvasConnection const& connection) {
+                return connection.source == sourceIndex && connection.outlet == outlet
+                    && connection.target == targetIndex && connection.inlet == inlet;
+            }), connections.end());
+        }
+    }
+
+    return true;
+}
+
+bool applyCanvasAdds(t_canvas* root, Array<var> const& edits, var& refMappings, var& identityMappings, bool& dispatched)
+{
+    struct LiveCanvas {
+        t_canvas* canvas = nullptr;
+        std::vector<int> preState;
+        std::vector<int> objects;
+        std::vector<int> beforeAddress;
+        std::vector<int> afterAddress;
+        std::vector<int> removedPreStateOrdinals;
+        bool preStateCanvas = true;
+        bool active = true;
+        bool hasAfterAddress = false;
+    };
+    struct LiveObject {
+        t_gobj* object = nullptr;
+        int canvasIndex = -1;
+        int childCanvasIndex = -1;
+        std::vector<int> beforeAddress;
+        std::vector<int> afterAddress;
+        bool preState = true;
+        bool subpatch = false;
+        bool active = true;
+        bool moved = false;
+        bool hasAfterAddress = false;
+    };
+    struct LiveConnection {
+        t_outconnect* pointer = nullptr;
+        int canvasIndex = -1;
+        int sourceIndex = -1;
+        int targetIndex = -1;
+        int outlet = 0;
+        int inlet = 0;
+        String pathInfo;
+    };
+    std::vector<LiveCanvas> canvases;
+    std::vector<LiveObject> objects;
+    std::vector<LiveConnection> oldConnections;
+    std::vector<t_outconnect*> newConnections;
+    std::vector<std::pair<String, int>> refs;
+    std::unordered_map<t_gobj*, int> objectIds;
+    refMappings = var(new DynamicObject());
+    identityMappings = var();
+
+    auto collect = [&](auto&& self, t_canvas* canvas, std::vector<int> const& path) -> int {
+        int const canvasIndex = static_cast<int>(canvases.size());
+        LiveCanvas liveCanvas;
+        liveCanvas.canvas = canvas;
+        liveCanvas.beforeAddress = path;
+        canvases.push_back(liveCanvas);
+        int ordinal = 0;
+        for (auto* item = canvas->gl_list; item; item = item->g_next, ++ordinal) {
+            LiveObject liveObject;
+            liveObject.object = item;
+            liveObject.canvasIndex = canvasIndex;
+            liveObject.subpatch = pd_class(&item->g_pd) == canvas_class;
+            liveObject.beforeAddress = path;
+            liveObject.beforeAddress.push_back(ordinal);
+            int const objectIndex = static_cast<int>(objects.size());
+            objects.push_back(liveObject);
+            objectIds.emplace(item, objectIndex);
+            canvases[static_cast<size_t>(canvasIndex)].preState.push_back(objectIndex);
+            canvases[static_cast<size_t>(canvasIndex)].objects.push_back(objectIndex);
+            if (liveObject.subpatch) {
+                auto childPath = liveObject.beforeAddress;
+                int const childIndex = self(self, reinterpret_cast<t_canvas*>(item), childPath);
+                objects[static_cast<size_t>(objectIndex)].childCanvasIndex = childIndex;
+            }
+        }
+        return canvasIndex;
+    };
+    collect(collect, root, {});
+    for (size_t index = 0; index < canvases.size(); ++index) {
+        t_linetraverser traversal;
+        linetraverser_start(&traversal, canvases[index].canvas);
+        while (auto* connection = linetraverser_next_nosize(&traversal))
+            oldConnections.push_back({ connection, static_cast<int>(index),
+                objectIds.at(&traversal.tr_ob->ob_g), objectIds.at(&traversal.tr_ob2->ob_g),
+                traversal.tr_outno, traversal.tr_inno,
+                traversal.outconnect_path_info != gensym("empty")
+                    ? String::fromUTF8(traversal.outconnect_path_info->s_name) : String() });
+    }
+
+    auto findRef = [&](String const& name) {
+        return std::find_if(refs.begin(), refs.end(), [&name](auto const& entry) { return entry.first == name; });
+    };
+    auto resolveCanvas = [&](var const& path) {
+        int canvasIndex = 0;
+        for (auto const& part : *path.getArray()) {
+            int objectIndex = -1;
+            if (nonnegativeOrdinal(part)) {
+                auto const& preState = canvases[static_cast<size_t>(canvasIndex)].preState;
+                int const ordinal = static_cast<int>(part);
+                if (ordinal < static_cast<int>(preState.size()))
+                    objectIndex = preState[static_cast<size_t>(ordinal)];
+            } else {
+                auto const found = findRef(part.getDynamicObject()->getProperty("ref").toString());
+                if (found != refs.end())
+                    objectIndex = found->second;
+            }
+            if (objectIndex < 0)
+                return -1;
+            auto const& object = objects[static_cast<size_t>(objectIndex)];
+            if (!object.active || !object.subpatch || object.childCanvasIndex < 0
+                || !canvases[static_cast<size_t>(object.childCanvasIndex)].active)
+                return -1;
+            canvasIndex = object.childCanvasIndex;
+        }
+        return canvases[static_cast<size_t>(canvasIndex)].active ? canvasIndex : -1;
+    };
+    auto resolveTarget = [&](var const& value, int const canvasIndex) {
+        int objectIndex = -1;
+        if (nonnegativeOrdinal(value)) {
+            auto const& preState = canvases[static_cast<size_t>(canvasIndex)].preState;
+            int const ordinal = static_cast<int>(value);
+            if (ordinal < static_cast<int>(preState.size()))
+                objectIndex = preState[static_cast<size_t>(ordinal)];
+        } else {
+            auto const found = findRef(value.getDynamicObject()->getProperty("ref").toString());
+            if (found != refs.end())
+                objectIndex = found->second;
+        }
+        if (objectIndex < 0)
+            return -1;
+        auto const& object = objects[static_cast<size_t>(objectIndex)];
+        return object.active && object.canvasIndex == canvasIndex ? objectIndex : -1;
+    };
+    auto deactivate = [&](auto&& self, int const objectIndex) -> void {
+        auto& object = objects[static_cast<size_t>(objectIndex)];
+        if (!object.active)
+            return;
+        object.active = false;
+        objectIds.erase(object.object);
+        if (object.childCanvasIndex < 0)
+            return;
+        auto& child = canvases[static_cast<size_t>(object.childCanvasIndex)];
+        if (!child.active)
+            return;
+        child.active = false;
+        for (auto const childObject : child.objects)
+            self(self, childObject);
+    };
+
+    bool dispatchSucceeded = true;
+    struct RemovedWire {
+        int sourceIndex, outlet, targetIndex, inlet;
+        t_symbol* path;
+    };
+    std::vector<RemovedWire> removedWires;
+    for (auto const& value : edits) {
+        auto* edit = value.getDynamicObject();
+        int const canvasIndex = resolveCanvas(edit->getProperty("canvas_path"));
+        if (canvasIndex < 0) {
+            dispatchSucceeded = false;
+            break;
+        }
+        auto* canvas = canvases[static_cast<size_t>(canvasIndex)].canvas;
+        auto const op = edit->getProperty("op").toString();
+        if (op == "move") {
+            int const objectIndex = resolveTarget(edit->getProperty("target"), canvasIndex);
+            if (objectIndex < 0) {
+                dispatchSucceeded = false;
+                break;
+            }
+            auto& target = objects[static_cast<size_t>(objectIndex)];
+            auto* text = Interface::checkObject(target.object);
+            if (!text) {
+                dispatchSucceeded = false;
+                break;
+            }
+            int const x = static_cast<int>(edit->getProperty("x"));
+            int const y = static_cast<int>(edit->getProperty("y"));
+            auto* instanceEditor = Interface::getInstanceEditor();
+            if (!instanceEditor->canvas_undo_already_set_move)
+                canvas_undo_add(canvas, UNDO_MOTION, "motion", canvas_undo_set_move(canvas, 0));
+            dispatched = true;
+            Interface::moveObject(canvas, target.object, x, y);
+            if (pd_class(&target.object->g_pd) == vinlet_class)
+                canvas_resortinlets(canvas);
+            else if (pd_class(&target.object->g_pd) == voutlet_class)
+                canvas_resortoutlets(canvas);
+            canvas_dirty(canvas, 1);
+            target.moved = true;
+            if (text->te_xpix != x || text->te_ypix != y) {
+                dispatchSucceeded = false;
+                break;
+            }
+            continue;
+        }
+        if (op == "remove") {
+            int const objectIndex = resolveTarget(edit->getProperty("target"), canvasIndex);
+            if (objectIndex < 0) {
+                dispatchSucceeded = false;
+                break;
+            }
+            auto* target = objects[static_cast<size_t>(objectIndex)].object;
+            if (objects[static_cast<size_t>(objectIndex)].preState) {
+                auto& removed = canvases[static_cast<size_t>(canvasIndex)].removedPreStateOrdinals;
+                int const ordinal = objects[static_cast<size_t>(objectIndex)].beforeAddress.back();
+                if (std::find(removed.begin(), removed.end(), ordinal) == removed.end())
+                    removed.push_back(ordinal);
+            }
+            deactivate(deactivate, objectIndex);
+            SmallArray<t_gobj*> targets;
+            targets.add(target);
+            canvas_undo_add(canvas, UNDO_SEQUENCE_START, "Remove object/s", nullptr);
+            dispatched = true;
+            Interface::removeObjects(canvas, targets);
+            Interface::finishRemove(canvas);
+            canvas_undo_add(canvas, UNDO_SEQUENCE_END, "Remove object/s", nullptr);
+            continue;
+        }
+        if (op == "connect" || op == "disconnect") {
+            int const sourceIndex = resolveTarget(edit->getProperty("source"), canvasIndex);
+            int const targetIndex = resolveTarget(edit->getProperty("target"), canvasIndex);
+            if (sourceIndex < 0 || targetIndex < 0 || sourceIndex == targetIndex) {
+                dispatchSucceeded = false;
+                break;
+            }
+            auto* source = Interface::checkObject(objects[static_cast<size_t>(sourceIndex)].object);
+            auto* target = Interface::checkObject(objects[static_cast<size_t>(targetIndex)].object);
+            int const outlet = static_cast<int>(edit->getProperty("outlet"));
+            int const inlet = static_cast<int>(edit->getProperty("inlet"));
+            if (!source || !target || outlet >= Interface::numOutlets(source) || inlet >= Interface::numInlets(target)
+                || (op == "connect" && Interface::isSignalOutlet(source, outlet) && !Interface::isSignalInlet(target, inlet))) {
+                dispatchSucceeded = false;
+                break;
+            }
+            bool const connected = Interface::hasConnection(canvas, source, outlet, target, inlet);
+            if (op == "connect") {
+                if (connected) {
+                    dispatchSucceeded = false;
+                    break;
+                }
+                auto const removed = std::find_if(removedWires.rbegin(), removedWires.rend(), [&](auto const& wire) {
+                    return wire.sourceIndex == sourceIndex && wire.outlet == outlet
+                        && wire.targetIndex == targetIndex && wire.inlet == inlet;
+                });
+                dispatched = true;
+                t_outconnect* connection = nullptr;
+                if (removed != removedWires.rend() && removed->path != gensym("empty")) {
+                    if (Interface::canConnect(canvas, source, outlet, target, inlet)) {
+                        connection = obj_connect(source, outlet, target, inlet);
+                        if (connection) {
+                            outconnect_set_path_data(connection, removed->path);
+                            canvas_undo_add(canvas, UNDO_CONNECT, "connect", canvas_undo_set_connect(canvas,
+                                canvas_getindex(canvas, &source->ob_g), outlet, canvas_getindex(canvas, &target->ob_g), inlet, removed->path));
+                            canvas_dirty(canvas, 1);
+                            glist_noselect(canvas);
+                        }
+                    }
+                } else {
+                    connection = Interface::createConnection(canvas, source, outlet, target, inlet);
+                }
+                if (!connection) {
+                    dispatchSucceeded = false;
+                    break;
+                }
+                newConnections.push_back(connection);
+            } else {
+                if (!connected) {
+                    dispatchSucceeded = false;
+                    break;
+                }
+                t_symbol* path = gensym("empty");
+                t_linetraverser traversal;
+                linetraverser_start(&traversal, canvas);
+                while (linetraverser_next_nosize(&traversal))
+                    if (traversal.tr_ob == source && traversal.tr_outno == outlet
+                        && traversal.tr_ob2 == target && traversal.tr_inno == inlet) {
+                        path = traversal.outconnect_path_info;
+                        break;
+                    }
+                removedWires.push_back({ sourceIndex, outlet, targetIndex, inlet, path });
+                dispatched = true;
+                Interface::removeConnection(canvas, source, outlet, target, inlet, path);
+                if (Interface::hasConnection(canvas, source, outlet, target, inlet)) {
+                    dispatchSucceeded = false;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (op != "add") {
+            dispatchSucceeded = false;
+            break;
+        }
+
+        std::vector<t_gobj*> before;
+        for (auto* item = canvas->gl_list; item; item = item->g_next)
+            before.push_back(item);
+        auto const type = edit->getProperty("type").toString();
+        int const x = static_cast<int>(edit->getProperty("x"));
+        int const y = static_cast<int>(edit->getProperty("y"));
+        dispatched = true;
+        if (type == "subpatch") {
+            t_atom subpatch[6], restore[4];
+            SETFLOAT(subpatch, 0);
+            SETFLOAT(subpatch + 1, 0);
+            SETFLOAT(subpatch + 2, 450);
+            SETFLOAT(subpatch + 3, 300);
+            SETSYMBOL(subpatch + 4, gensym(edit->getProperty("name").toString().toRawUTF8()));
+            SETFLOAT(subpatch + 5, 0);
+            SETFLOAT(restore, x);
+            SETFLOAT(restore + 1, y);
+            SETSYMBOL(restore + 2, gensym("pd"));
+            restore[3] = subpatch[4];
+            canvas_setcurrent(canvas);
+            auto* child = canvas_new(nullptr, gensym("canvas"), 6, subpatch);
+            pd_typedmess(&child->gl_pd, gensym("restore"), 4, restore);
+            canvas_unsetcurrent(canvas);
+        } else {
+            auto* words = binbuf_new();
+            auto const text = edit->getProperty("text").toString();
+            binbuf_text(words, text.toRawUTF8(), text.getNumBytesAsUTF8());
+            std::vector<t_atom> args(static_cast<size_t>(binbuf_getnatom(words) + 2));
+            SETFLOAT(args.data(), x);
+            SETFLOAT(args.data() + 1, y);
+            std::copy_n(binbuf_getvec(words), binbuf_getnatom(words), args.data() + 2);
+            Interface::createObject(canvas, gensym(type == "comment" ? "text" : "obj"), static_cast<int>(args.size()), args.data());
+            binbuf_free(words);
+        }
+        t_gobj* created = nullptr;
+        int added = 0;
+        for (auto* item = canvas->gl_list; item; item = item->g_next)
+            if (std::find(before.begin(), before.end(), item) == before.end()) {
+                created = item;
+                ++added;
+            }
+        if (added != 1 || !created) {
+            dispatchSucceeded = false;
+            break;
+        }
+        if (type == "subpatch") {
+            if (pd_class(&created->g_pd) != canvas_class || reinterpret_cast<t_canvas*>(created)->gl_owner != canvas
+                || reinterpret_cast<t_canvas*>(created)->gl_list) {
+                dispatchSucceeded = false;
+                break;
+            }
+            canvas_undo_add(canvas, UNDO_CREATE, "create", canvas_undo_set_create(canvas));
+            canvas_dirty(canvas, 1);
+        } else {
+            auto* text = Interface::checkObject(created);
+            if (!text || pd_class(&created->g_pd) == canvas_class
+                || text->te_type != (type == "comment" ? T_TEXT : T_OBJECT)
+                || (type == "object" && pd_class(&created->g_pd) == text_class)) {
+                dispatchSucceeded = false;
+                break;
+            }
+        }
+        LiveObject createdObject;
+        createdObject.object = created;
+        createdObject.canvasIndex = canvasIndex;
+        createdObject.preState = false;
+        createdObject.subpatch = type == "subpatch";
+        int const createdIndex = static_cast<int>(objects.size());
+        objects.push_back(createdObject);
+        objectIds.emplace(created, createdIndex);
+        canvases[static_cast<size_t>(canvasIndex)].objects.push_back(createdIndex);
+        if (type == "subpatch") {
+            LiveCanvas child;
+            child.canvas = reinterpret_cast<t_canvas*>(created);
+            int const childIndex = static_cast<int>(canvases.size());
+            canvases.push_back(child);
+            canvases[static_cast<size_t>(childIndex)].preStateCanvas = false;
+            objects[static_cast<size_t>(createdIndex)].childCanvasIndex = childIndex;
+        }
+        refs.emplace_back(edit->getProperty("ref").toString(), createdIndex);
+#if ENABLE_TESTING
+        if (canvasEditFailureHookForTesting) {
+            auto const hook = canvasEditFailureHookForTesting;
+            auto* const context = canvasEditFailureContextForTesting;
+            canvasEditFailureHookForTesting = nullptr;
+            canvasEditFailureContextForTesting = nullptr;
+            hook(context);
+            dispatchSucceeded = false;
+            break;
+        }
+#endif
+    }
+
+    auto collectAfter = [&](auto&& self, t_canvas* canvas, std::vector<int> const& path) -> void {
+        int ordinal = 0;
+        for (auto* item = canvas->gl_list; item; item = item->g_next, ++ordinal) {
+            auto const found = objectIds.find(item);
+            if (found != objectIds.end()) {
+                auto& object = objects[static_cast<size_t>(found->second)];
+                object.afterAddress = path;
+                object.afterAddress.push_back(ordinal);
+                object.hasAfterAddress = true;
+                if (object.childCanvasIndex >= 0) {
+                    auto& child = canvases[static_cast<size_t>(object.childCanvasIndex)];
+                    child.afterAddress = object.afterAddress;
+                    child.hasAfterAddress = true;
+                }
+            }
+            if (pd_class(&item->g_pd) == canvas_class) {
+                auto childPath = path;
+                childPath.push_back(ordinal);
+                self(self, reinterpret_cast<t_canvas*>(item), childPath);
+            }
+        }
+    };
+    canvases[0].hasAfterAddress = true;
+    collectAfter(collectAfter, root, {});
+
+    auto toAddress = [](std::vector<int> const& address) {
+        Array<var> result;
+        for (auto const ordinal : address)
+            result.add(ordinal);
+        return var(result);
+    };
+    for (auto const& [name, objectIndex] : refs) {
+        auto const& object = objects[static_cast<size_t>(objectIndex)];
+        if (!object.active || !object.hasAfterAddress)
+            continue;
+        auto* address = new DynamicObject();
+        int const ordinal = object.afterAddress.back();
+        auto const pathLength = object.subpatch ? object.afterAddress.size() : object.afterAddress.size() - 1;
+        Array<var> path;
+        for (size_t index = 0; index < pathLength; ++index)
+            path.add(object.afterAddress[index]);
+        address->setProperty("canvas_path", var(path));
+        address->setProperty("ordinal", ordinal);
+        refMappings.getDynamicObject()->setProperty(name, var(address));
+    }
+
+    if (dispatched) {
+        Array<var> survivors, invalidated;
+        for (auto const& object : objects) {
+            if (!object.preState)
+                continue;
+            if (!object.active || !object.hasAfterAddress) {
+                bool coveredByAncestor = false;
+                for (auto const& ancestor : objects) {
+                    if (!ancestor.preState || ancestor.active || !ancestor.subpatch
+                        || ancestor.beforeAddress.size() >= object.beforeAddress.size())
+                        continue;
+                    if (std::equal(ancestor.beforeAddress.begin(), ancestor.beforeAddress.end(), object.beforeAddress.begin())) {
+                        coveredByAncestor = true;
+                        break;
+                    }
+                }
+                if (coveredByAncestor)
+                    continue;
+                if (object.subpatch) {
+                    auto* subtree = new DynamicObject();
+                    subtree->setProperty("before", toAddress(object.beforeAddress));
+                    subtree->setProperty("descendants", true);
+                    invalidated.add(var(subtree));
+                } else {
+                    invalidated.add(toAddress(object.beforeAddress));
+                }
+            } else {
+                auto* mapping = new DynamicObject();
+                mapping->setProperty("before", toAddress(object.beforeAddress));
+                mapping->setProperty("after", toAddress(object.afterAddress));
+                mapping->setProperty("moved", object.moved);
+                survivors.add(var(mapping));
+            }
+        }
+        Array<var> rebasedCanvases;
+        for (auto const& canvas : canvases) {
+            if (!canvas.preStateCanvas || !canvas.active || !canvas.hasAfterAddress || canvas.removedPreStateOrdinals.empty())
+                continue;
+            auto* rebase = new DynamicObject();
+            rebase->setProperty("before_canvas_path", toAddress(canvas.beforeAddress));
+            rebase->setProperty("after_canvas_path", toAddress(canvas.afterAddress));
+            Array<var> removedOrdinals;
+            for (auto const ordinal : canvas.removedPreStateOrdinals)
+                removedOrdinals.add(ordinal);
+            rebase->setProperty("removed_ordinals", var(removedOrdinals));
+            rebasedCanvases.add(var(rebase));
+        }
+        auto* mappings = new DynamicObject();
+        Array<var> canvasMappings;
+        for (auto const& canvas : canvases)
+            if (canvas.preStateCanvas && canvas.active && canvas.hasAfterAddress) {
+                auto* mapping = new DynamicObject();
+                mapping->setProperty("before", toAddress(canvas.beforeAddress));
+                mapping->setProperty("after", toAddress(canvas.afterAddress));
+                canvasMappings.add(var(mapping));
+            }
+        Array<var> connectionMappings, invalidatedConnections, createdConnections, createdCanvases;
+        for (auto const& canvas : canvases)
+            if (!canvas.preStateCanvas && canvas.active && canvas.hasAfterAddress)
+                createdCanvases.add(toAddress(canvas.afterAddress));
+        for (auto const& connection : oldConnections) {
+            auto const& source = objects[static_cast<size_t>(connection.sourceIndex)];
+            auto const& target = objects[static_cast<size_t>(connection.targetIndex)];
+            auto const& canvas = canvases[static_cast<size_t>(connection.canvasIndex)];
+            auto* before = new DynamicObject();
+            before->setProperty("canvas_path", toAddress(canvas.beforeAddress));
+            before->setProperty("source", source.beforeAddress.back());
+            before->setProperty("outlet", connection.outlet);
+            before->setProperty("target", target.beforeAddress.back());
+            before->setProperty("inlet", connection.inlet);
+            if (connection.pathInfo.isNotEmpty())
+                before->setProperty("path_info", connection.pathInfo);
+            bool found = false;
+            if (source.active && target.active && canvas.active && canvas.hasAfterAddress
+                && std::find(newConnections.begin(), newConnections.end(), connection.pointer) == newConnections.end()) {
+                t_linetraverser traversal;
+                linetraverser_start(&traversal, canvas.canvas);
+                while (auto* current = linetraverser_next_nosize(&traversal))
+                    if (current == connection.pointer && &traversal.tr_ob->ob_g == source.object
+                        && &traversal.tr_ob2->ob_g == target.object) {
+                        auto* after = new DynamicObject();
+                        after->setProperty("canvas_path", toAddress(canvas.afterAddress));
+                        after->setProperty("source", source.afterAddress.back());
+                        after->setProperty("outlet", traversal.tr_outno);
+                        after->setProperty("target", target.afterAddress.back());
+                        after->setProperty("inlet", traversal.tr_inno);
+                        if (traversal.outconnect_path_info != gensym("empty"))
+                            after->setProperty("path_info", String::fromUTF8(traversal.outconnect_path_info->s_name));
+                        auto* mapping = new DynamicObject();
+                        mapping->setProperty("before", var(before));
+                        mapping->setProperty("after", var(after));
+                        connectionMappings.add(var(mapping));
+                        found = true;
+                        break;
+                    }
+            }
+            if (!found)
+                invalidatedConnections.add(var(before));
+        }
+        for (auto const& canvas : canvases) {
+            if (!canvas.active || !canvas.hasAfterAddress)
+                continue;
+            t_linetraverser traversal;
+            linetraverser_start(&traversal, canvas.canvas);
+            while (auto* current = linetraverser_next_nosize(&traversal)) {
+                bool survived = false;
+                for (auto const& old : oldConnections)
+                    if (old.pointer == current && old.canvasIndex >= 0
+                        && canvases[static_cast<size_t>(old.canvasIndex)].canvas == canvas.canvas
+                        && objects[static_cast<size_t>(old.sourceIndex)].active
+                        && objects[static_cast<size_t>(old.targetIndex)].active
+                        && objects[static_cast<size_t>(old.sourceIndex)].object == &traversal.tr_ob->ob_g
+                        && objects[static_cast<size_t>(old.targetIndex)].object == &traversal.tr_ob2->ob_g
+                        && std::find(newConnections.begin(), newConnections.end(), current) == newConnections.end()) {
+                        survived = true;
+                        break;
+                    }
+                if (survived)
+                    continue;
+                auto* created = new DynamicObject();
+                created->setProperty("canvas_path", toAddress(canvas.afterAddress));
+                created->setProperty("source", canvas_getindex(canvas.canvas, &traversal.tr_ob->ob_g));
+                created->setProperty("outlet", traversal.tr_outno);
+                created->setProperty("target", canvas_getindex(canvas.canvas, &traversal.tr_ob2->ob_g));
+                created->setProperty("inlet", traversal.tr_inno);
+                if (traversal.outconnect_path_info != gensym("empty"))
+                    created->setProperty("path_info", String::fromUTF8(traversal.outconnect_path_info->s_name));
+                createdConnections.add(var(created));
+            }
+        }
+        mappings->setProperty("canvases", var(canvasMappings));
+        mappings->setProperty("created_canvases", var(createdCanvases));
+        mappings->setProperty("connections", var(connectionMappings));
+        mappings->setProperty("created_connections", var(createdConnections));
+        mappings->setProperty("invalidated_connections", var(invalidatedConnections));
+        mappings->setProperty("survivors", var(survivors));
+        mappings->setProperty("invalidated", var(invalidated));
+        mappings->setProperty("rebased_canvases", var(rebasedCanvases));
+        identityMappings = var(mappings);
+    }
+    return dispatchSucceeded;
+}
+
+var makeCanvasUncertain(int const requestId, String const& revision, var const& refs, var const& identityMappings)
+{
+    auto response = makeDebugError(requestId, "PartialOrUncertain", "Inspect current structure before any retry");
+    auto* error = response.getDynamicObject()->getProperty("error").getDynamicObject();
+    error->setProperty("revision", revision);
+    auto* recovery = new DynamicObject();
+    recovery->setProperty("operation", "read_canvas");
+    recovery->setProperty("canvas_path", var(Array<var>()));
+    recovery->setProperty("expected_revision", revision);
+    error->setProperty("recovery", var(recovery));
+    if (refs.isObject())
+        error->setProperty("refs", refs);
+    if (identityMappings.isObject())
+        error->setProperty("mappings", identityMappings);
+    auto exceedsReplyLimit = [&response] {
+        return Base64::toBase64(JSON::toString(response, true)).getNumBytesAsUTF8() > maxEncodedDebugResponseBytes;
+    };
+    if (exceedsReplyLimit())
+        error->removeProperty("refs");
+    if (exceedsReplyLimit() && identityMappings.isObject()) {
+        auto* mappings = error->getProperty("mappings").getDynamicObject();
+        Array<var> movedSurvivors;
+        auto const* survivors = mappings->getProperty("survivors").getArray();
+        if (survivors)
+            for (auto const& survivor : *survivors) {
+                auto* entry = survivor.getDynamicObject();
+                if (entry && static_cast<bool>(entry->getProperty("moved")))
+                    movedSurvivors.add(survivor);
+            }
+        mappings->setProperty("survivors", var(movedSurvivors));
+    }
+    if (exceedsReplyLimit())
+        error->removeProperty("mappings");
+    if (exceedsReplyLimit())
+        error->removeProperty("refs");
+    return response;
+}
+
+bool canvasRecoveryReadable(int const requestId, String const& revision, Array<var> const& records)
+{
+    String const cursorPrefix = revision + ":" + SHA256(JSON::toString(var(Array<var>())).getCharPointer()).toHexString().substring(0, 16) + ":";
+    String const cursor = cursorPrefix + String(records.size());
+    for (auto const& record : records) {
+        Array<var> singleRecord { record };
+        if (Base64::toBase64(JSON::toString(makeCanvasPage(requestId, revision, singleRecord, cursor), true)).getNumBytesAsUTF8()
+            > maxEncodedDebugResponseBytes)
+            return false;
+    }
+    return true;
+}
+
+var makeCanvasPage(int const requestId, String const& revision, Array<var> const& records, var const& nextCursor)
+{
+    auto response = makeDebugSuccess(requestId);
+    auto* data = response.getDynamicObject()->getProperty("data").getDynamicObject();
+    data->setProperty("revision", revision);
+    data->setProperty("records", var(records));
+    data->setProperty("next_cursor", nextCursor);
+    return response;
 }
 
 class StrictJsonValidator {
@@ -797,6 +2120,24 @@ struct Instance::internal {
     }
 };
 
+#if ENABLE_TESTING
+void setCanvasEditInterleaveHookForTesting(void (*hook)(void*), void* context)
+{
+    canvasEditInterleaveHookForTesting = hook;
+    canvasEditInterleaveContextForTesting = context;
+}
+void setCanvasEditFailureHookForTesting(void (*hook)(void*), void* context)
+{
+    canvasEditFailureHookForTesting = hook;
+    canvasEditFailureContextForTesting = context;
+}
+void setCanvasEditGuiMismatchHookForTesting(void (*hook)(void*), void* context)
+{
+    canvasEditGuiMismatchHookForTesting = hook;
+    canvasEditGuiMismatchContextForTesting = context;
+}
+#endif
+
 Instance::Instance()
     : messageDispatcher(std::make_unique<MessageDispatcher>())
     , consoleMessageHandler(std::make_unique<ConsoleMessageHandler>(this))
@@ -932,12 +2273,16 @@ void Instance::initialisePd(String& pdlua_version)
                     }
                 });
             } else {
-                MessageManager::callAsync([inst = juce::WeakReference(inst), glist] {
+                MessageManager::callAsync([inst = juce::WeakReference(inst), canvasToClose = pd::WeakReference(glist, inst)] {
                     if (auto const* pd = static_cast<PluginProcessor*>(inst.get())) {
                         for (auto* editor : pd->getEditors()) {
                             for (auto* canvas : editor->getCanvases()) {
-                                auto canvasPtr = canvas->patch.getPointer();
-                                if (canvasPtr && canvasPtr.get() == glist) {
+                                auto shouldClose = [&] {
+                                    auto canvasPtr = canvas->patch.getPointer();
+                                    auto* closingCanvas = canvasToClose.getRaw<t_glist>();
+                                    return canvasPtr && closingCanvas && canvasPtr.get() == closingCanvas && !canvasPtr->gl_havewindow;
+                                }();
+                                if (shouldClose) {
                                     canvas->editor->getTabComponent().closeTab(canvas, false);
                                     break;
                                 }
@@ -1694,8 +3039,619 @@ void Instance::handleDebugMessage(Message const& message)
     if (!operation.isString()
         || (operation.toString() != "set_generation" && operation.toString() != "send_object"
             && operation.toString() != "get_console" && operation.toString() != "clear_console"
-            && operation.toString() != "export_canvas")) {
+            && operation.toString() != "export_canvas" && operation.toString() != "read_canvas"
+            && operation.toString() != "edit_canvas")) {
         reply(makeDebugError(requestId, "UnknownOperation", "Unknown debug operation"), requestId);
+        return;
+    }
+
+    if (operation.toString() == "read_canvas" || operation.toString() == "edit_canvas") {
+        if (!canvasRequestValid(*request, operation.toString() == "edit_canvas")) {
+            reply(makeDebugError(requestId, "InvalidRequest", "Canvas request contains invalid, unknown or out-of-bounds fields"), requestId);
+            return;
+        }
+        if (operation.toString() == "edit_canvas") {
+            String preflightError;
+            Array<var> records;
+            String revision;
+            String postDispatchRevision;
+            String recoveryGeneration = request->getProperty("generation").toString();
+            String beforeRevision;
+            var refMappings;
+            var identityMappings;
+            bool dispatched = false;
+            struct DisplayedCanvas {
+                Component::SafePointer<Canvas> component;
+                std::unique_ptr<pd::WeakReference> identity;
+                bool inRoot = false;
+            };
+            std::vector<DisplayedCanvas> displayed;
+            for (auto* editor : static_cast<PluginProcessor*>(this)->getEditors()) {
+                for (auto* canvas : editor->getCanvases())
+                    displayed.push_back({ canvas, nullptr, false });
+                if (auto* canvas = editor->getPluginModeCanvas())
+                    displayed.push_back({ canvas, nullptr, false });
+            }
+            Array<pd::Patch::Ptr> subpatchTabsToClose;
+            struct TabRestoreState {
+                pd::Patch::Ptr patch;
+                juce::Component::SafePointer<PluginEditor> editor;
+                int splitIndex;
+                bool wasVisible;
+            };
+            std::vector<TabRestoreState> tabsToRestore;
+            std::unique_ptr<pd::WeakReference> pinnedRootIdentity;
+            auto runEditUnderLock = [&](bool const collectSubpatchTabs) {
+                records.clear();
+                revision.clear();
+                refMappings = var();
+                identityMappings = var();
+                dispatched = false;
+                preflightError.clear();
+                if (debugGeneration != request->getProperty("generation").toString()) {
+                    preflightError = "StaleGeneration";
+                    return;
+                }
+                if (!debugRoot || !debugRoot->isValid()) {
+                    preflightError = "CanvasNotFound";
+                    return;
+                }
+
+                auto* root = debugRoot->getRawUnchecked<t_canvas>();
+                if (pd_class(&root->gl_obj.ob_pd) != canvas_class) {
+                    preflightError = "CanvasNotFound";
+                    return;
+                }
+                if (!pinnedRootIdentity) {
+                    pinnedRootIdentity = std::make_unique<pd::WeakReference>(root, this);
+                } else if (!pinnedRootIdentity->isValid() || pinnedRootIdentity->getRaw<t_canvas>() != root) {
+                    preflightError = "StaleGeneration";
+                    return;
+                }
+                for (auto& view : displayed)
+                    if (!view.identity && view.component) {
+                        if (auto* native = view.component->patch.getRawPointer()) {
+                            view.identity = std::make_unique<pd::WeakReference>(native, this);
+                            view.inRoot = canvasIsInRoot(root, native);
+                        }
+                    }
+                appendCanvasRecords(root, {}, records);
+                revision = SHA256(JSON::toString(var(records), true).getCharPointer()).toHexString();
+                if (request->getProperty("expected_revision").toString() != revision) {
+                    preflightError = "StaleRevision";
+                    return;
+                }
+                if (!canvasRecoveryReadable(requestId, revision, records)) {
+                    preflightError = "RecordTooLarge";
+                    return;
+                }
+
+                std::vector<t_canvas*> removedSubpatches;
+                if (!preflightCanvasEdits(root, *request->getProperty("edits").getArray(), preflightError, removedSubpatches))
+                    return;
+
+                if (collectSubpatchTabs) {
+                    subpatchTabsToClose.clear();
+                    for (auto* removedSubpatch : removedSubpatches) {
+                        for (auto const& patch : patches) {
+                            if (!patch || patch->getRawPointer() != removedSubpatch)
+                                continue;
+                            bool const alreadyIncluded = std::any_of(subpatchTabsToClose.begin(), subpatchTabsToClose.end(), [&](auto const& existing) {
+                                return existing.get() == patch.get();
+                            });
+                            if (!alreadyIncluded)
+                                subpatchTabsToClose.add(patch);
+                        }
+                    }
+                    if (!subpatchTabsToClose.isEmpty())
+                        return;
+                }
+
+                if (!applyCanvasAdds(root, *request->getProperty("edits").getArray(), refMappings, identityMappings, dispatched))
+                    preflightError = dispatched ? "PartialOrUncertain" : "NotYetAvailable";
+                beforeRevision = request->getProperty("expected_revision").toString();
+                records.clear();
+                appendCanvasRecords(root, {}, records);
+                revision = SHA256(JSON::toString(var(records), true).getCharPointer()).toHexString();
+            };
+
+            lockAudioThread();
+            runEditUnderLock(true);
+            bool const closeTabsBeforeDelete = preflightError.isEmpty() && !subpatchTabsToClose.isEmpty();
+            unlockAudioThread();
+
+            if (closeTabsBeforeDelete) {
+                auto const registrationsToRestore = subpatchTabsToClose;
+                tabsToRestore.clear();
+                auto const closeResult = MessageManager::callSync([instance = juce::WeakReference(this), subpatchTabsToClose, &tabsToRestore] {
+                    auto* processor = static_cast<PluginProcessor*>(instance.get());
+                    if (!processor)
+                        return false;
+
+                    for (auto const& patch : subpatchTabsToClose) {
+                        if (!patch)
+                            continue;
+                        for (auto* editor : processor->getEditors()) {
+                            bool closed = false;
+                            for (auto* canvas : editor->getCanvases()) {
+                                if (canvas && canvas->patch == *patch) {
+                                    bool wasVisible = false;
+                                    processor->lockAudioThread();
+                                    if (auto* nativeCanvas = patch->getRawPointer())
+                                        wasVisible = nativeCanvas->gl_havewindow;
+                                    processor->unlockAudioThread();
+                                    tabsToRestore.push_back({ patch, editor, patch->splitViewIndex, wasVisible });
+                                    canvas->editor->getTabComponent().closeTab(canvas, false);
+                                    closed = true;
+                                    break;
+                                }
+                            }
+                            if (closed)
+                                break;
+                        }
+                        processor->patches.remove_one(patch, [](auto const& registered, auto const& closing) {
+                            return registered.get() == closing.get();
+                        });
+                    }
+                    return true;
+                });
+
+                if (!closeResult || !*closeResult) {
+                    preflightError = "NotYetAvailable";
+                } else {
+                    subpatchTabsToClose.clear();
+#if ENABLE_TESTING
+                    auto const interleaveHook = canvasEditInterleaveHookForTesting;
+                    auto* const interleaveContext = canvasEditInterleaveContextForTesting;
+                    canvasEditInterleaveHookForTesting = nullptr;
+                    canvasEditInterleaveContextForTesting = nullptr;
+                    if (interleaveHook)
+                        interleaveHook(interleaveContext);
+#endif
+                    lockAudioThread();
+                    runEditUnderLock(false);
+                    unlockAudioThread();
+
+                    if (preflightError.isNotEmpty() && !dispatched) {
+                        auto const restoreResult = MessageManager::callSync([instance = juce::WeakReference(this),
+                                                                               rootIdentity = pinnedRootIdentity.get(),
+                                                                               registrationsToRestore, tabsToRestore] {
+                            auto* processor = static_cast<PluginProcessor*>(instance.get());
+                            if (!processor || !rootIdentity)
+                                return false;
+
+                            auto isInOriginalRoot = [](auto&& self, t_canvas* root, t_canvas* candidate) -> bool {
+                                if (root == candidate)
+                                    return true;
+                                for (auto* object = root->gl_list; object; object = object->g_next) {
+                                    if (pd_class(&object->g_pd) == canvas_class
+                                        && self(self, reinterpret_cast<t_canvas*>(object), candidate))
+                                        return true;
+                                }
+                                return false;
+                            };
+
+                            for (auto const& tab : tabsToRestore) {
+                                auto* originalEditor = tab.editor.getComponent();
+                                if (!originalEditor || originalEditor->editorIndex != tab.patch->windowIndex)
+                                    return false;
+                            }
+
+                            bool valid = true;
+                            processor->lockAudioThread();
+                            auto* originalRoot = rootIdentity->getRaw<t_canvas>();
+                            valid = originalRoot && pd_class(&originalRoot->gl_obj.ob_pd) == canvas_class;
+                            if (valid) {
+                                for (auto const& patch : registrationsToRestore) {
+                                    auto* nativeCanvas = patch ? patch->getRawPointer() : nullptr;
+                                    if (!nativeCanvas || !isInOriginalRoot(isInOriginalRoot, originalRoot, nativeCanvas))
+                                        valid = false;
+                                }
+                            }
+                            if (valid) {
+                                for (auto const& tab : tabsToRestore) {
+                                    auto* nativeCanvas = tab.patch ? tab.patch->getRawPointer() : nullptr;
+                                    if (!nativeCanvas || !isInOriginalRoot(isInOriginalRoot, originalRoot, nativeCanvas))
+                                        valid = false;
+                                }
+                            }
+                            processor->unlockAudioThread();
+                            if (!valid)
+                                return false;
+
+                            for (auto const& patch : registrationsToRestore) {
+                                processor->patches.add_unique(patch, [](auto const& registered, auto const& restoring) {
+                                    return *registered == *restoring;
+                                });
+                            }
+
+                            for (auto const& tab : tabsToRestore) {
+                                auto* targetEditor = tab.editor.getComponent();
+                                auto* reopened = targetEditor->getTabComponent().openPatch(tab.patch, false, tab.wasVisible);
+                                if (!reopened || reopened->editor != targetEditor)
+                                    return false;
+                                targetEditor->getTabComponent().showTab(reopened, tab.splitIndex);
+                            }
+                            bool viewsRestored = true;
+                            for (auto const& tab : tabsToRestore) {
+                                bool found = false;
+                                for (auto* canvas : tab.editor->getCanvases())
+                                    if (canvas && canvas->patch == *tab.patch)
+                                        found = true;
+                                viewsRestored = viewsRestored && found;
+                            }
+
+                            processor->lockAudioThread();
+                            originalRoot = rootIdentity->getRaw<t_canvas>();
+                            valid = originalRoot && pd_class(&originalRoot->gl_obj.ob_pd) == canvas_class;
+                            if (valid) {
+                                for (auto const& tab : tabsToRestore) {
+                                    auto* nativeCanvas = tab.patch->getRawPointer();
+                                    if (!nativeCanvas || !isInOriginalRoot(isInOriginalRoot, originalRoot, nativeCanvas)
+                                        || static_cast<bool>(nativeCanvas->gl_havewindow) != tab.wasVisible)
+                                        valid = false;
+                                }
+                            }
+                            processor->unlockAudioThread();
+                            return viewsRestored && valid;
+                        });
+
+                        if (!restoreResult || !*restoreResult) {
+                            preflightError = "PartialOrUncertain";
+                            records.clear();
+                            revision.clear();
+                            lockAudioThread();
+                            if (debugRoot && debugRoot->isValid()) {
+                                auto* currentRoot = debugRoot->getRawUnchecked<t_canvas>();
+                                if (pd_class(&currentRoot->gl_obj.ob_pd) == canvas_class) {
+                                    appendCanvasRecords(currentRoot, {}, records);
+                                    revision = SHA256(JSON::toString(var(records), true).getCharPointer()).toHexString();
+                                }
+                            }
+                            unlockAudioThread();
+                        }
+                    }
+                }
+            }
+
+            postDispatchRevision = revision;
+            if (preflightError.isNotEmpty()) {
+                if (preflightError == "PartialOrUncertain") {
+                    reply(makeCanvasUncertain(requestId, revision, refMappings, identityMappings), requestId);
+                    return;
+                }
+                String const message = preflightError == "StaleGeneration" ? "Generation does not match the active generation"
+                    : preflightError == "StaleRevision" ? "Root structure changed"
+                    : preflightError == "RecordTooLarge" ? "Authoritative root readback contains a record larger than the reply bound"
+                    : preflightError == "NotYetAvailable" ? "Could not close subpatch tabs before deletion"
+                    : "Canvas edit batch failed preflight";
+                reply(makeDebugError(requestId, preflightError, message), requestId);
+            } else {
+                if (!dispatched) {
+                    reply(makeDebugError(requestId, "NotYetAvailable", "Canvas editing is not yet available for this batch"), requestId);
+                    return;
+                }
+                auto reconcileGui = [&] {
+                    bool valid = true;
+                    auto collectOpenedViews = [&] {
+                        lockAudioThread();
+                        auto* root = pinnedRootIdentity ? pinnedRootIdentity->getRaw<t_canvas>() : nullptr;
+                        if (root)
+                            for (auto* editor : static_cast<PluginProcessor*>(this)->getEditors()) {
+                                auto includeView = [&](Canvas* canvas) {
+                                    if (!canvas)
+                                        return;
+                                    bool const known = std::any_of(displayed.begin(), displayed.end(), [canvas](auto const& view) {
+                                        return view.component.getComponent() == canvas;
+                                    });
+                                    if (!known)
+                                        if (auto* native = canvas->patch.getRawPointer(); native && canvasIsInRoot(root, native))
+                                            displayed.push_back({ canvas, std::make_unique<pd::WeakReference>(native, this), true });
+                                };
+                                for (auto* canvas : editor->getCanvases())
+                                    includeView(canvas);
+                                includeView(editor->getPluginModeCanvas());
+                            }
+                        unlockAudioThread();
+                    };
+                    collectOpenedViews();
+                    for (auto& view : displayed) {
+                        if (!view.inRoot)
+                            continue;
+                        if (!view.identity || !view.identity->isValid()) {
+                            if (view.component)
+                                valid = false;
+                            continue;
+                        }
+                        auto* canvas = view.component.getComponent();
+                        if (!canvas) {
+                            valid = false;
+                            continue;
+                        }
+                        canvas->performSynchronise();
+                        if (!view.component)
+                            valid = false;
+                    }
+                    auto const syncedViews = displayed.size();
+                    collectOpenedViews();
+                    if (displayed.size() != syncedViews)
+                        valid = false;
+                    std::vector<Component::SafePointer<Canvas>> embeddedViews;
+                    auto collectEmbedded = [&](auto&& self, Component* parent) -> void {
+                        for (int index = 0; index < parent->getNumChildComponents(); ++index) {
+                            Component::SafePointer<Component> child(parent->getChildComponent(index));
+                            if (auto* embedded = dynamic_cast<Canvas*>(child.getComponent())) {
+                                bool const alreadySeen = std::any_of(embeddedViews.begin(), embeddedViews.end(), [embedded](auto const& view) {
+                                    return view.getComponent() == embedded;
+                                });
+                                if (!alreadySeen) {
+                                    embeddedViews.push_back(embedded);
+                                    embedded->performSynchronise();
+                                }
+                            }
+                            if (child)
+                                self(self, child.getComponent());
+                            else
+                                valid = false;
+                        }
+                    };
+                    for (auto& view : displayed)
+                        if (view.inRoot && view.component)
+                            collectEmbedded(collectEmbedded, view.component.getComponent());
+#if ENABLE_TESTING
+                    if (canvasEditGuiMismatchHookForTesting) {
+                        auto const hook = canvasEditGuiMismatchHookForTesting;
+                        auto* const context = canvasEditGuiMismatchContextForTesting;
+                        canvasEditGuiMismatchHookForTesting = nullptr;
+                        canvasEditGuiMismatchContextForTesting = nullptr;
+                        hook(context);
+                    }
+#endif
+                    lockAudioThread();
+                    auto* root = pinnedRootIdentity ? pinnedRootIdentity->getRaw<t_canvas>() : nullptr;
+                    auto* currentRoot = debugRoot ? debugRoot->getRaw<t_canvas>() : nullptr;
+                    recoveryGeneration = debugGeneration;
+                    valid = valid && root && currentRoot == root
+                        && recoveryGeneration == request->getProperty("generation").toString();
+                    if (root && currentRoot == root) {
+                        records.clear();
+                        appendCanvasRecords(root, {}, records);
+                        String const currentRevision = SHA256(JSON::toString(var(records), true).getCharPointer()).toHexString();
+                        valid = valid && currentRevision == revision;
+                        if (currentRevision != postDispatchRevision) {
+                            refMappings = var();
+                            identityMappings = var();
+                        }
+                        revision = currentRevision;
+                        for (auto& view : displayed)
+                            if (view.inRoot && view.identity && view.identity->isValid()) {
+                                auto* canvas = view.component.getComponent();
+                                valid = valid && canvas && canvas->patch.getRawPointer() == view.identity->getRaw<t_canvas>()
+                                    && canvasIsInRoot(root, view.identity->getRaw<t_canvas>())
+                                    && canvasGuiMatchesPd(canvas);
+                            }
+                        for (auto& view : embeddedViews)
+                            if (auto* canvas = view.getComponent(); canvas && canvasIsInRoot(root, canvas->patch.getRawPointer()))
+                                valid = valid && canvasGuiMatchesPd(canvas);
+                            else
+                                valid = false;
+                    } else {
+                        refMappings = var();
+                        identityMappings = var();
+                        revision.clear();
+                        records.clear();
+                        if (currentRoot && pd_class(&currentRoot->gl_obj.ob_pd) == canvas_class) {
+                            appendCanvasRecords(currentRoot, {}, records);
+                            revision = SHA256(JSON::toString(var(records), true).getCharPointer()).toHexString();
+                        }
+                    }
+                    unlockAudioThread();
+                    return valid;
+                };
+                bool guiConverged = false;
+                if (MessageManager::getInstance()->isThisTheMessageThread())
+                    guiConverged = reconcileGui();
+                else if (auto result = MessageManager::callSync(reconcileGui))
+                    guiConverged = *result;
+
+                if (guiConverged && canvasRecoveryReadable(requestId, revision, records)) {
+                    auto response = makeDebugSuccess(requestId);
+                    auto* data = response.getDynamicObject()->getProperty("data").getDynamicObject();
+                    data->setProperty("status", "applied");
+                    data->setProperty("revision", revision);
+                    data->setProperty("pre_revision", beforeRevision);
+                    auto* mappings = identityMappings.getDynamicObject();
+                    if (!mappings)
+                        mappings = new DynamicObject();
+                    mappings->setProperty("refs", refMappings);
+                    data->setProperty("mappings", var(mappings));
+                    data->setProperty("next_cursor", var());
+                    if (Base64::toBase64(JSON::toString(response, true)).getNumBytesAsUTF8() <= maxEncodedDebugResponseBytes) {
+                        debugCanvasMappingRecords.clear();
+                        debugCanvasMappingRevision.clear();
+                        debugCanvasMappingGeneration.clear();
+                        debugCanvasMappingCursorPrefix.clear();
+                        debugCanvasMappingRoot.reset();
+                        reply(response, requestId);
+                        return;
+                    }
+                    Array<var> mappingRecords;
+                    if (auto* refs = refMappings.getDynamicObject())
+                        for (auto const& [name, value] : refs->getProperties()) {
+                            auto* record = new DynamicObject();
+                            record->setProperty("kind", "ref");
+                            record->setProperty("ref", name.toString());
+                            record->setProperty("value", value);
+                            mappingRecords.add(var(record));
+                        }
+                    for (auto const* category : { "canvases", "created_canvases", "survivors", "invalidated", "rebased_canvases", "connections", "created_connections", "invalidated_connections" }) {
+                        auto const categoryValue = mappings->getProperty(category);
+                        if (auto* entries = categoryValue.getArray())
+                            for (auto const& value : *entries) {
+                                auto* record = new DynamicObject();
+                                record->setProperty("kind", category);
+                                record->setProperty("value", value);
+                                mappingRecords.add(var(record));
+                            }
+                    }
+                    String const prefix = "m:" + SHA256((beforeRevision + ":" + JSON::toString(var(mappingRecords), true)).getCharPointer()).toHexString().substring(0, 16)
+                        + ":" + revision + ":";
+                    bool pageable = true;
+                    for (auto const& record : mappingRecords)
+                        if (Base64::toBase64(JSON::toString(makeCanvasPage(requestId, revision, { record }, prefix + String(mappingRecords.size())), true)).getNumBytesAsUTF8()
+                            > maxEncodedDebugResponseBytes)
+                            pageable = false;
+                    if (pageable && !mappingRecords.isEmpty()) {
+                        data->setProperty("mappings", var(new DynamicObject()));
+                        data->setProperty("next_cursor", prefix + "0");
+                        if (Base64::toBase64(JSON::toString(response, true)).getNumBytesAsUTF8() <= maxEncodedDebugResponseBytes) {
+                            debugCanvasMappingRecords = mappingRecords;
+                            debugCanvasMappingRevision = revision;
+                            debugCanvasMappingGeneration = request->getProperty("generation").toString();
+                            debugCanvasMappingCursorPrefix = prefix;
+                            lockAudioThread();
+                            debugCanvasMappingRoot = std::make_unique<pd::WeakReference>(pinnedRootIdentity->getRaw<t_canvas>(), this);
+                            unlockAudioThread();
+                            reply(response, requestId);
+                            return;
+                        }
+                    }
+                }
+                auto uncertain = makeCanvasUncertain(requestId, revision, refMappings, identityMappings);
+                if (recoveryGeneration != request->getProperty("generation").toString())
+                    if (auto* recovery = uncertain.getDynamicObject()->getProperty("error").getDynamicObject()->getProperty("recovery").getDynamicObject())
+                        recovery->setProperty("generation", recoveryGeneration);
+                auto* error = uncertain.getDynamicObject()->getProperty("error").getDynamicObject();
+                if (Base64::toBase64(JSON::toString(uncertain, true)).getNumBytesAsUTF8() > maxEncodedDebugResponseBytes)
+                    error->removeProperty("mappings");
+                if (Base64::toBase64(JSON::toString(uncertain, true)).getNumBytesAsUTF8() > maxEncodedDebugResponseBytes)
+                    error->removeProperty("refs");
+                reply(uncertain, requestId);
+            }
+            return;
+        }
+
+        String runtimeError;
+        Array<var> allRecords;
+        auto const& requestedPath = *request->getProperty("canvas_path").getArray();
+        lockAudioThread();
+        if (debugGeneration != request->getProperty("generation").toString()) {
+            runtimeError = "StaleGeneration";
+        } else if (!debugRoot || !debugRoot->isValid()) {
+            runtimeError = "CanvasNotFound";
+        } else {
+            auto* root = debugRoot->getRawUnchecked<t_canvas>();
+            if (pd_class(&root->gl_obj.ob_pd) != canvas_class) {
+                runtimeError = "CanvasNotFound";
+            } else {
+                auto* canvas = root;
+                for (auto const& component : requestedPath) {
+                    auto* object = canvas->gl_list;
+                    for (int ordinal = static_cast<int>(component); object && ordinal > 0; --ordinal)
+                        object = object->g_next;
+                    if (!object) {
+                        runtimeError = "CanvasNotFound";
+                        break;
+                    }
+                    if (pd_class(&object->g_pd) != canvas_class) {
+                        runtimeError = "CanvasTypeMismatch";
+                        break;
+                    }
+                    canvas = reinterpret_cast<t_canvas*>(object);
+                }
+                if (runtimeError.isEmpty())
+                    appendCanvasRecords(root, {}, allRecords);
+            }
+        }
+        unlockAudioThread();
+
+        if (runtimeError.isNotEmpty()) {
+            reply(makeDebugError(requestId, runtimeError, "Canvas target could not be resolved"), requestId);
+            return;
+        }
+
+        auto const revision = SHA256(JSON::toString(var(allRecords), true).getCharPointer()).toHexString();
+        if (request->hasProperty("expected_revision") && request->getProperty("expected_revision").toString() != revision) {
+            reply(makeDebugError(requestId, "StaleRevision", "Root structure changed"), requestId);
+            return;
+        }
+
+        if (request->hasProperty("cursor") && request->getProperty("cursor").toString().startsWith("m:")) {
+            auto const cursor = request->getProperty("cursor").toString();
+            bool valid = requestedPath.isEmpty() && cursor.startsWith(debugCanvasMappingCursorPrefix)
+                && debugCanvasMappingRevision == revision
+                && debugCanvasMappingGeneration == request->getProperty("generation").toString();
+            lockAudioThread();
+            valid = valid && debugCanvasMappingRoot && debugRoot && debugCanvasMappingRoot->isValid()
+                && debugRoot->isValid() && debugCanvasMappingRoot->getRaw<t_canvas>() == debugRoot->getRaw<t_canvas>();
+            unlockAudioThread();
+            if (!valid) {
+                reply(makeDebugError(requestId, "StaleRevision", "Mapping no longer belongs to this root revision"), requestId);
+                return;
+            }
+            auto const suffix = cursor.substring(debugCanvasMappingCursorPrefix.length());
+            if (suffix.isEmpty() || !suffix.containsOnly("0123456789") || suffix.length() > 10
+                || suffix.getLargeIntValue() >= debugCanvasMappingRecords.size()) {
+                reply(makeDebugError(requestId, "InvalidRequest", "Invalid mapping cursor"), requestId);
+                return;
+            }
+            Array<var> page;
+            for (int index = static_cast<int>(suffix.getLargeIntValue()); index < debugCanvasMappingRecords.size(); ++index) {
+                page.add(debugCanvasMappingRecords[index]);
+                var const next = index + 1 < debugCanvasMappingRecords.size()
+                    ? var(debugCanvasMappingCursorPrefix + String(index + 1)) : var();
+                if (Base64::toBase64(JSON::toString(makeCanvasPage(requestId, revision, page, next), true)).getNumBytesAsUTF8() > maxEncodedDebugResponseBytes) {
+                    page.removeLast(1);
+                    reply(makeCanvasPage(requestId, revision, page, debugCanvasMappingCursorPrefix + String(index)), requestId);
+                    return;
+                }
+            }
+            reply(makeCanvasPage(requestId, revision, page, var()), requestId);
+            return;
+        }
+
+        Array<var> records;
+        for (auto const& entry : allRecords) {
+            auto* record = entry.getDynamicObject();
+            auto const& path = *record->getProperty("canvas_path").getArray();
+            if (path.size() < requestedPath.size())
+                continue;
+            bool inSubtree = true;
+            for (int index = 0; index < requestedPath.size(); ++index)
+                inSubtree &= static_cast<int>(path[index]) == static_cast<int>(requestedPath[index]);
+            if (inSubtree)
+                records.add(entry);
+        }
+
+        String const cursorPrefix = revision + ":" + SHA256(JSON::toString(var(requestedPath), true).getCharPointer()).toHexString().substring(0, 16) + ":";
+        int start = 0;
+        if (request->hasProperty("cursor")) {
+            auto const cursor = request->getProperty("cursor").toString();
+            auto const suffix = cursor.fromFirstOccurrenceOf(cursorPrefix, false, false);
+            if (!cursor.startsWith(cursorPrefix) || suffix.isEmpty() || suffix.startsWithChar('0')
+                || !suffix.containsOnly("0123456789") || suffix.length() > 10
+                || suffix.getLargeIntValue() >= records.size()) {
+                reply(makeDebugError(requestId, "InvalidRequest", "Invalid canvas cursor"), requestId);
+                return;
+            }
+            start = static_cast<int>(suffix.getLargeIntValue());
+        }
+
+        Array<var> page;
+        for (int index = start; index < records.size(); ++index) {
+            page.add(records[index]);
+            var const next = index + 1 < records.size() ? var(cursorPrefix + String(index + 1)) : var();
+            if (Base64::toBase64(JSON::toString(makeCanvasPage(requestId, revision, page, next), true)).getNumBytesAsUTF8() > maxEncodedDebugResponseBytes) {
+                page.removeLast(1);
+                if (page.isEmpty()) {
+                    reply(makeDebugError(requestId, "RecordTooLarge", "Single canvas record exceeds 60 KiB"), requestId);
+                    return;
+                }
+                reply(makeCanvasPage(requestId, revision, page, cursorPrefix + String(index)), requestId);
+                return;
+            }
+        }
+        reply(makeCanvasPage(requestId, revision, page, var()), requestId);
         return;
     }
 
@@ -2105,6 +4061,11 @@ void Instance::handleDebugMessage(Message const& message)
     lockAudioThread();
     debugGeneration.clear();
     debugRoot.reset();
+    debugCanvasMappingRecords.clear();
+    debugCanvasMappingRevision.clear();
+    debugCanvasMappingGeneration.clear();
+    debugCanvasMappingCursorPrefix.clear();
+    debugCanvasMappingRoot.reset();
 
     auto* rootObject = generateSymbol(rootReceiver)->s_thing;
     if (!rootObject) {
@@ -2145,6 +4106,11 @@ void Instance::clearDebugGeneration()
     lockAudioThread();
     debugGeneration.clear();
     debugRoot.reset();
+    debugCanvasMappingRecords.clear();
+    debugCanvasMappingRevision.clear();
+    debugCanvasMappingGeneration.clear();
+    debugCanvasMappingCursorPrefix.clear();
+    debugCanvasMappingRoot.reset();
     unlockAudioThread();
 }
 

@@ -343,6 +343,11 @@ private:
     void* debugReceiver = nullptr;
     String debugGeneration;
     std::unique_ptr<WeakReference> debugRoot;
+    Array<var> debugCanvasMappingRecords;
+    String debugCanvasMappingRevision;
+    String debugCanvasMappingGeneration;
+    String debugCanvasMappingCursorPrefix;
+    std::unique_ptr<WeakReference> debugCanvasMappingRoot;
 
     std::unique_ptr<FileChooser> openChooser;
     static inline auto luaClasses = UnorderedSet<hash32>(); // Keep track of class names that correspond to pdlua objects
