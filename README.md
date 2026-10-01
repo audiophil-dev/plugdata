@@ -176,12 +176,118 @@ with `request_id: 0`.
   requested path, so this operation is intended for the local managed-tool
   trust boundary.
 
+### Canvas read/edit wire contract (v1)
+
+`read_canvas` returns live structural records. `edit_canvas` adds objects,
+comments and empty subpatches, moves or removes records, and connects or
+disconnects cords at root or nested depth without clearing or reopening the
+root. `edit_canvas` preflights its generation and root-wide revision under the
+Pd lock, then dispatches the ordered batch while holding that lock. When
+deleting an open subpatch, its tabs are closed on the JUCE message thread
+between preflight and dispatch, then the root and revision are checked again
+under the Pd lock. A successful `status: "applied"` means Pd and all displayed
+affected GUI models have been reconciled and checked before the reply. It does
+not promise atomic rollback if dispatch fails. An unchanged preflight rejection has
+`ok:false`; a post-dispatch failure has `PartialOrUncertain` and requires
+authoritative readback before planning another edit.
+
+```json
+{"version":1,"request_id":101,"operation":"read_canvas","generation":"session-1","canvas_path":[]}
+{"version":1,"request_id":102,"operation":"read_canvas","generation":"session-1","canvas_path":[],"cursor":"<next_cursor from 101>","expected_revision":"<revision from 101>"}
+{"version":1,"request_id":103,"operation":"edit_canvas","generation":"session-1","expected_revision":"<current revision>","edits":[{"op":"move","canvas_path":[2],"target":0,"x":45,"y":50},{"op":"add","canvas_path":[],"ref":"new","type":"object","x":210,"y":45,"text":"print result"},{"op":"connect","canvas_path":[],"source":0,"outlet":0,"target":{"ref":"new"},"inlet":0}]}
+```
+
+`read_canvas` requires `generation` and an ordinal-only `canvas_path` (empty
+for the root); `cursor` and `expected_revision` are optional nonempty opaque
+strings, but `cursor` requires `expected_revision`. `edit_canvas` requires `generation`, a nonempty `expected_revision`,
+and 1-100 ordered `edits`. Each edit requires `op` and `canvas_path`. Path
+components are nonnegative pre-transaction ordinals or exactly `{ "ref":
+"id" }` identifying a subpatch added earlier in this batch. `add` requires
+a unique batch-local `ref`, `type` (`object`, `comment`, `subpatch`), integer
+`x`,`y`, and either `text` for object/comment or `name` for subpatch. `move`
+requires `target`, `x`,`y`; `remove` requires `target`; `connect` and
+`disconnect` require `source`,`outlet`,`target`,`inlet`. Targets are
+nonnegative pre-state ordinals or exactly `{ "ref": "id" }` for an earlier
+added record. Refs cannot be reused, referenced before creation, or used
+after removal; removing a created subpatch invalidates its ref path.
+Before dispatch, live preflight checks generation and the
+root-wide revision under one Pd lock, resolves pre-state ordinals and earlier
+subpatch refs against pinned identities, projects adds/removes and edge
+changes, and validates existing-object port bounds, signal compatibility,
+same-canvas endpoints, and edge presence. A class added earlier in the batch
+has no known runtime ports until it is instantiated; those checks remain for
+the dispatch stage. No edit is dispatched by preflight.
+
+Unknown or missing fields at any level, noninteger ordinals/coordinates/ports,
+paths deeper than 32, coordinates outside -1000000..1000000, empty or
+oversized strings (generation/ref/name/revision/cursor: 128 UTF-8 bytes;
+text: 2048 UTF-8 bytes), and batches over 100 edits are `InvalidRequest`.
+The shared 64 KiB encoded / 48 KiB decoded request limits still apply.
+
+`read_canvas` replies return a root-wide content-derived opaque SHA-256
+`revision`, an ordered bounded `records` page (canvas/object/connection with
+ordinal paths including descendants of the requested canvas), and
+`next_cursor` (null at the last page). A continuation
+must supply its `cursor` and the page's `expected_revision`; an old token
+fails `StaleRevision`, never mixing pages. The cursor is bound to both token
+and requested path. An invalid cursor returns `InvalidRequest`; a record
+larger than the reply limit returns `RecordTooLarge` rather than being skipped.
+Text objects and subpatch boxes carry canvas-local `x`/`y` positions. Pd
+scalars carry their `template` name and `x`/`y` in template data coordinates with
+`coordinate_space: "data"`. Other non-text Pd objects have no common
+side-effect-free position primitive; their record states
+`position_available: false` rather than inventing coordinates from GUI bounds.
+An applied edit replies with `pre_revision`, the new `revision`, and mappings
+for pre/post canvas and object addresses, created/invalidated cords, rebased
+canvases, invalidated descendants and batch refs. If mappings exceed one reply,
+the edit reply has an empty `mappings` object and `next_cursor` beginning `m:`;
+read its pages using `read_canvas` at root with that cursor and the new revision
+until `next_cursor` is null. These mapping pages contain records with `kind`
+(`ref`, `canvases`, `survivors`, etc.) and `value`; a later edit invalidates the
+cursor. A preflight rejection uses the ordinary `ok:false,error:{code,message}`
+envelope without changing Pd. A post-dispatch failure includes revision-bound
+recovery instructions but makes no rollback claim.
+
+Example read and edit `data` / `error` shapes are:
+
+```json
+{"version":1,"request_id":101,"ok":true,"data":{"revision":"opaque-root-token","records":[{"kind":"canvas","canvas_path":[],"name":"root"},{"kind":"object","canvas_path":[],"ordinal":0,"type":"object","x":20,"y":20,"text":"t b b"},{"kind":"object","canvas_path":[],"ordinal":1,"type":"object","x":120,"y":20,"text":"print result"},{"kind":"connection","canvas_path":[],"source":0,"outlet":0,"target":1,"inlet":0}],"next_cursor":null}}
+{"version":1,"request_id":103,"ok":true,"data":{"status":"applied","revision":"new-root-token","pre_revision":"old-root-token","mappings":{"canvases":[{"before":[],"after":[]},{"before":[2],"after":[2]}],"created_canvases":[],"connections":[],"created_connections":[{"canvas_path":[],"source":0,"outlet":0,"target":3,"inlet":0}],"invalidated_connections":[],"survivors":[{"before":[2,0],"after":[2,0],"moved":true}],"invalidated":[],"rebased_canvases":[],"refs":{"new":{"canvas_path":[],"ordinal":3}}},"next_cursor":null}}
+{"version":1,"request_id":103,"ok":false,"error":{"code":"StaleRevision","message":"Root structure changed"}}
+{"version":1,"request_id":103,"ok":false,"error":{"code":"PartialOrUncertain","message":"Inspect current structure before any retry","revision":"current-root-token","recovery":{"operation":"read_canvas","canvas_path":[],"expected_revision":"current-root-token"},"refs":{"new":{"canvas_path":[],"ordinal":3}}}}
+```
+
 ### Stable errors
 
 `InvalidEnvelope`, `UnsupportedProtocolVersion`, `PayloadTooLarge`,
 `InvalidRequest`, `UnknownOperation`, `StaleGeneration`, `CanvasNotFound`,
 `CanvasTypeMismatch`, `ObjectNotFound`, `ObjectTypeMismatch`,
 `InvalidSelector`, `InvalidAtoms`, `ResponseTooLarge`, `ExportFailed`.
+Canvas operations also return `StaleRevision`, `RecordTooLarge`, `InvalidPort`,
+`InvalidConnection`, and `PartialOrUncertain`. `NotYetAvailable` can report a
+batch that could not dispatch (for example, failure to close a selected child
+tab before deletion); it is not the normal response for a supported edit.
+
+### Recovery and relay
+
+For an unchanged `StaleRevision` or `StaleGeneration`, obtain a fresh binding
+and full `read_canvas` snapshot, then plan against its current revision and
+addresses. For `PartialOrUncertain`, read the reported recovery revision and
+all pages before deciding what remains to do. A timeout or broken reply has
+**unknown outcome**: do not automatically resend the edit, even with the same
+`request_id`. Re-establish the reply channel, bind the live root again if
+necessary, and compare an authoritative root snapshot with the intended edit.
+Save/close/reopen is an explicit persistence action, never an edit fallback.
+
+The existing pd-mcp PlugData wrapper relays `request <base64-json>` through
+its edit port and returns `response <base64-json>` via `[netsend -b]`. The
+September 2026 report's earlier ~999-character text-mode truncation was fixed
+by binary relay; do not impose that obsolete limit on the fork. Measure the
+complete base64 frame on the actual managed path, check its correlated
+`request_id`, and cap it at 60 KiB. The relay does not expose canvas editing
+through pd-mcp's public live-edit tools; those still reject unsupported
+mutations. Use a managed `ENABLE_TESTING=0` fork binary pinned via
+`PD_MCP_BINARY`, not an installed upstream application or a test-suite binary.
 
 ### Limits
 
@@ -194,8 +300,15 @@ set `truncated: true` rather than splitting a message.
 ### Threading
 
 Requests are parsed and validated on the JUCE message thread before the Pd
-lock is taken; `send_object` resolves its path and dispatches in a single
-lock acquisition. Console pending-message enqueue, drain, and hard clear
+lock is taken. `send_object` resolves its path and dispatches in a single lock
+acquisition. `edit_canvas` checks the registered generation and root-wide
+revision and preflights its ordered edits under the Pd lock, then dispatches
+the batch under that lock. If deleting an open subpatch requires closing its
+tab, the tab close happens on the JUCE message thread outside the lock, and
+generation and revision are checked again before dispatch. After dispatch,
+the affected displayed canvas models are synchronized and checked before an
+`applied` reply is sent. This acknowledgment does not promise rollback on a
+post-dispatch failure. Console pending-message enqueue, drain, and hard clear
 share one small mutex that is never held while acquiring the Pd lock.
 
 ### Scope
@@ -208,21 +321,50 @@ through these receivers; that integration is out of scope here.
 
 Two build flavors serve different purposes:
 
-- `ENABLE_TESTING=OFF` (default): normal application behavior. Settings persist
+- `ENABLE_TESTING=0` (default): normal application behavior. Settings persist
   in `Documents/plugdata/settings.json`, so state such as `onboarding_completed`
   survives across launches.
-- `ENABLE_TESTING=1`: for running the test suite, which launches only when the
-  `PLUGDATA_RUN_TESTS=1` environment variable is set; without it the binary
-  starts as a normal application. In this flavor, `SettingsFile` substitutes a
+- `ENABLE_TESTING=1`: use for running the test suite with
+  `PLUGDATA_RUN_TESTS=1`. Without that variable the binary starts as a normal
+  application. In this flavor, `SettingsFile` substitutes a
   fresh temporary file for `settings.json` on every launch, so every settings
   write is discarded when the process exits.
 
-Managed tooling that drives the debug API across sessions should use an
-`ENABLE_TESTING=OFF` build, because in a test build no setting (including
-`onboarding_completed`) persists and the onboarding dialog reappears on every
-launch. Use the test build only for suite runs. A managed launcher that
-redirects `HOME` should also account for plugdata's app data directory being
-`$HOME/Documents/plugdata`.
+From the fork repository root on macOS, configure and build the managed
+debug-API bundle, then copy/sign it before building another flavor:
+
+```sh
+cmake -B build-managed -GNinja -DENABLE_TESTING=0
+cmake --build build-managed
+mkdir -p Plugins/Standalone-managed
+ditto Plugins/Standalone/plugdata.app Plugins/Standalone-managed/plugdata.app
+codesign --force --deep -s - Plugins/Standalone-managed/plugdata.app
+codesign --verify --deep --strict Plugins/Standalone-managed/plugdata.app
+```
+
+Both CMake build directories write `Plugins/Standalone/plugdata.app`; building
+one flavor replaces that shared bundle.
+`ENABLE_TESTING=1` uses a fresh temporary settings file each launch, so settings
+such as `onboarding_completed` do not persist and onboarding can reappear.
+A managed launcher that redirects `HOME` should also account for plugdata's
+app data directory being `$HOME/Documents/plugdata`.
+
+To verify the managed fork without joining an existing pd-mcp session, run:
+
+```sh
+node Tests/canvas-edit-managed-probe.mjs --binary Plugins/Standalone-managed/plugdata.app/Contents/MacOS/plugdata --output .omo/evidence/canvas-edit-managed.json
+```
+
+The probe copies the sibling pd-mcp wrapper and bridge into a disposable
+directory, changes only their local listener ports, verifies both listeners
+belong to its own child PID, and removes its home and patches afterward. It
+never connects to another process's fixed ports 3011/3013. Its JSON evidence
+includes the correlated decoded replies, encoded byte counts, saved Pd source,
+and process cleanup. Its default request timeout is 10 seconds; a timeout is
+recorded as an unknown outcome, not retried, and followed by authoritative
+readback in the timeout case. The probe's binary relay accepts encoded replies
+up to 60 KiB. A timeout or broken reply in other clients likewise has unknown
+outcome; don't automatically resend an edit, and inspect the live canvas first.
 
 ### Licensing note for this fork
 
