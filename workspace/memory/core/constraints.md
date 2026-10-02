@@ -1,3 +1,5 @@
 # Constraints
 
+[2026-10-02 09:40:00] - Pd search paths do not recurse: a library folder must be added as its own path entry. ml.lib lives in both `~/Documents/plugdata/Versions/0.9.3-release/Extra/ml.lib` and `~/Documents/plugdata/Versions/0.9.4-test3/Extra/ml.lib`; each version needs the entry pointing at its own tree. The 0.9.3 copy carries a com.apple.macl app-bound ACL (EPERM even with sudo); PlugData re-points the top-level Extra/Abstractions symlinks to the last-launched app's version tree. Terminal Full Disk Access resolves user-side EPERM; the agent shell can stat but not enumerate those directories.
+
 [2026-10-01 12:35:20] - A timed-out edit has unknown outcome: read current structure before retrying. Structural revisions are content-derived, not monotonic counters; a GUI edit can make a prior token stale. Unaffected object control state and DSP-on mode were sampled before/after live edits; uninterrupted waveform output was not proven. Deleting an object cannot retain that object's state. The named Direct Debug API cases and managed probe passed, but known unrelated full-suite failures remain; do not describe the full suite as green.
