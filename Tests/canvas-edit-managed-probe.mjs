@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
+import { inflateSync } from 'node:zlib';
 import { basename, dirname, join, resolve } from 'node:path';
 
 const options = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, index, args) => {
@@ -145,16 +146,101 @@ async function until(action, description) {
     throw new Error(`Timed out waiting for ${description}`);
 }
 
+// Minimal PNG decode: IHDR + concatenated IDAT inflate + per-row unfilter.
+// Supports the 8-bit RGB/RGBA non-interlaced output JUCE's PNGImageFormat writes.
+function decodePng(bytes) {
+    const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    assert(bytes.subarray(0, 8).equals(signature), 'png signature');
+    let offset = 8;
+    let width = 0;
+    let height = 0;
+    let bitDepth = 0;
+    let colorType = 0;
+    const idat = [];
+    while (offset + 8 <= bytes.length) {
+        const length = bytes.readUInt32BE(offset);
+        const type = bytes.toString('ascii', offset + 4, offset + 8);
+        const data = bytes.subarray(offset + 8, offset + 8 + length);
+        if (type === 'IHDR') {
+            width = data.readUInt32BE(0);
+            height = data.readUInt32BE(4);
+            bitDepth = data[8];
+            colorType = data[9];
+        } else if (type === 'IDAT') idat.push(data);
+        else if (type === 'IEND') break;
+        offset += 12 + length;
+    }
+    assert(bitDepth === 8 && (colorType === 6 || colorType === 2), `png is 8-bit RGB/RGBA (got depth ${bitDepth} type ${colorType})`);
+    const bpp = colorType === 6 ? 4 : 3;
+    const raw = inflateSync(Buffer.concat(idat));
+    const stride = width * bpp;
+    assert(raw.length >= height * (stride + 1), 'png raw size matches dimensions');
+    const pixels = Buffer.alloc(height * stride);
+    let position = 0;
+    for (let y = 0; y < height; y++) {
+        const filter = raw[position++];
+        const row = y * stride;
+        for (let x = 0; x < stride; x++) {
+            const value = raw[position++];
+            const left = x >= bpp ? pixels[row + x - bpp] : 0;
+            const up = y > 0 ? pixels[row - stride + x] : 0;
+            const upLeft = x >= bpp && y > 0 ? pixels[row - stride + x - bpp] : 0;
+            let predictor;
+            if (filter === 0) predictor = 0;
+            else if (filter === 1) predictor = left;
+            else if (filter === 2) predictor = up;
+            else if (filter === 3) predictor = (left + up) >> 1;
+            else {
+                const p = left + up - upLeft;
+                const pa = Math.abs(p - left);
+                const pb = Math.abs(p - up);
+                const pc = Math.abs(p - upLeft);
+                predictor = pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
+            }
+            pixels[row + x] = (value + predictor) & 0xff;
+        }
+    }
+    return {
+        width,
+        height,
+        pixel(x, y) {
+            const at = (y * width + x) * bpp;
+            return [pixels[at], pixels[at + 1], pixels[at + 2]];
+        },
+        backgroundSample(x, y, w, h) {
+            const first = this.pixel(x, y);
+            for (let yy = y; yy < y + h; yy += 7) {
+                for (let xx = x; xx < x + w; xx += 7) {
+                    const p = this.pixel(xx, yy);
+                    if (p[0] !== first[0] || p[1] !== first[1] || p[2] !== first[2]) return null;
+                }
+            }
+            return first;
+        },
+        regionHasNonBackground(x, y, w, h, background) {
+            for (let yy = y; yy < y + h; yy += 2) {
+                for (let xx = x; xx < x + w; xx += 2) {
+                    const p = this.pixel(xx, yy);
+                    if (Math.abs(p[0] - background[0]) + Math.abs(p[1] - background[1]) + Math.abs(p[2] - background[2]) > 24) return true;
+                }
+            }
+            return false;
+        },
+    };
+}
+
 try {
     const sourceWrapper = readFileSync(join(sibling, 'pd_mcp_target_session_plugdata.pd'), 'utf8');
     const sourceBridge = readFileSync(join(sibling, 'pd_mcp_bridge.pd'), 'utf8');
-    check(sourceWrapper.includes('netreceive -f 3013;') && sourceBridge.includes('netreceive 3011;'), 'sibling wrapper ports match expected source');
+    check(sourceWrapper.includes('#X msg 24 410 3013;') && sourceWrapper.includes('r pd-mcp-edit-port;')
+        && sourceBridge.includes('#X msg 22 360 3011;') && sourceBridge.includes('r pd-mcp-command-port;'),
+        'sibling wrapper ports match expected source');
     const bridgePort = await freePort();
     let editPort = await freePort();
     while (editPort === bridgePort) editPort = await freePort();
     check(![3011, 3013].includes(editPort) && ![3011, 3013].includes(bridgePort), 'isolated ports exclude foreign listeners');
-    writeFileSync(join(directory, 'pd_mcp_target_session_plugdata.pd'), sourceWrapper.replace('netreceive -f 3013;', `netreceive -f ${editPort};`));
-    writeFileSync(join(directory, 'pd_mcp_bridge.pd'), sourceBridge.replace('netreceive 3011;', `netreceive ${bridgePort};`));
+    writeFileSync(join(directory, 'pd_mcp_target_session_plugdata.pd'), sourceWrapper.replace('#X msg 24 410 3013;', `#X msg 24 410 ${editPort};`));
+    writeFileSync(join(directory, 'pd_mcp_bridge.pd'), sourceBridge.replace('#X msg 22 360 3011;', `#X msg 22 360 ${bridgePort};`));
     const home = join(directory, 'home');
     mkdirSync(join(home, 'Documents', 'plugdata'), { recursive: true });
     listener = createServer((socket) => socket.on('data', (chunk) => {
@@ -331,8 +417,98 @@ try {
         && JSON.stringify(finalComment.canvas_path) === '[]' && finalComment.text === `snapshot-439-${'x'.repeat(96)}`
         && finalComment.x === 10 && finalComment.y === 8022, 'last paged comment has expected text and root address');
     evidence.large = { pages: pages.pages, largestEncodedBytes: pages.largest, recordBytes: Buffer.byteLength(JSON.stringify(largeRecord)), records: pages.records.length };
+
+    // --- export_canvas full-content cases (full-canvas-offscreen-export task 6) ---
+    const exportFixture = join(directory, 'export-fixture.pd');
+    writeFileSync(exportFixture, '#N canvas 100 100 800 500 12;\n'
+        + '#X obj 20 20 print near;\n#X obj 3000 1000 print far;\n'
+        + '#N canvas 0 0 300 200 child 0;\n#X obj 20 20 bng 20 250 50 0 empty empty 0 -6 0 8 -262144 -1 -1;\n#X coords 0 0 450 300 300 200 1;\n#X restore 100 100 pd child;\n'
+        + '#N canvas 0 0 300 200 hidden 0;\n#X obj 20 20 print inside-hidden;\n#X restore 150 150 pd hidden;\n');
+    await pd('pd', `open ${basename(exportFixture)} ${dirname(exportFixture)}`);
+    const exportReceiver = `pd-${basename(exportFixture)}`;
+    const exportGeneration = 'export-fixture-generation';
+    await until(async () => (await request(editPort, 'set_generation', { generation: exportGeneration, root_receiver: exportReceiver })).ok, 'export fixture registration');
+    const exportSnapshot = await read(editPort, exportGeneration);
+    check(exportSnapshot.records.some((record) => record.kind === 'object' && record.text === 'print far'), 'export fixture has far object');
+
+    const exportDir = join(directory, 'exports');
+    mkdirSync(exportDir, { recursive: true });
+    const exportPng = join(exportDir, 'full-content.png');
+    const exportRequest = (fields) => request(editPort, 'export_canvas', { generation: exportGeneration, path: exportPng, ...fields });
+
+    // (a) full-content export of a far-separated patch
+    const rootExport = await exportRequest({});
+    check(rootExport.ok === true && rootExport.data.status === 'saved' && rootExport.data.clipped === false, 'full-content export replies saved with clipped false');
+    const rootPngBytes = readFileSync(exportPng);
+    const rootPng = decodePng(rootPngBytes);
+    check(rootPng.width >= 3028 && rootPng.height >= 1028, `export dimensions cover far content (${rootPng.width}x${rootPng.height})`);
+    check(rootPng.width < 3400 && rootPng.height < 1400, 'export dimensions stay near logical extent');
+    const rootBackground = rootPng.backgroundSample(1200, 400, 400, 300);
+    check(rootBackground !== null, 'background sample is uniform between far objects');
+    check(rootPng.regionHasNonBackground(24, 24, 60, 40, rootBackground), 'near landmark differs from background');
+    check(rootPng.regionHasNonBackground(3004, 1004, 60, 40, rootBackground), 'far landmark differs from background');
+    check(!rootPng.regionHasNonBackground(1200, 400, 400, 300, rootBackground), 'gap between landmarks is background only');
+
+    // (b) scale 2 doubles dimensions
+    const scaledExport = await exportRequest({ scale: 2 });
+    check(scaledExport.ok === true && scaledExport.data.status === 'saved' && scaledExport.data.clipped === false, 'scale 2 export replies saved');
+    const scaledPng = decodePng(readFileSync(exportPng));
+    check(scaledPng.width === rootPng.width * 2 && scaledPng.height === rootPng.height * 2, 'scale 2 doubles both dimensions');
+    check(scaledPng.regionHasNonBackground(6008, 2008, 120, 80, scaledPng.backgroundSample(2400, 800, 800, 600)), 'scale 2 far landmark differs from background');
+
+    // (c) graph-on-parent child canvas via ordinal path; never-opened child fails typed
+    const childPng = join(exportDir, 'child.png');
+    let childExport;
+    await until(async () => {
+        childExport = await request(editPort, 'export_canvas', { generation: exportGeneration, path: childPng, canvas_path: [2] });
+        return childExport.ok === true;
+    }, 'opened child canvas export');
+    check(childExport.data.status === 'saved' && childExport.data.clipped === false, 'opened child canvas exports via ordinal path');
+    const childDecoded = decodePng(readFileSync(childPng));
+    check(childDecoded.width >= 68 && childDecoded.height >= 68 && childDecoded.width < 400 && childDecoded.height < 400, `child export is child-sized (${childDecoded.width}x${childDecoded.height})`);
+    check(childDecoded.regionHasNonBackground(24, 24, 20, 20, childDecoded.backgroundSample(48, 8, 16, 16)), 'child landmark differs from background');
+
+    const hiddenExport = await request(editPort, 'export_canvas', { generation: exportGeneration, path: join(exportDir, 'hidden.png'), canvas_path: [3] });
+    check(!hiddenExport.ok && hiddenExport.error.code === 'CanvasNotFound', 'never-opened child replies CanvasNotFound');
+    check(!existsSync(join(exportDir, 'hidden.png')), 'never-opened child writes no file');
+
+    // (d) oversized extent with sentinel destination preserved
+    const oversized = join(directory, 'oversized.pd');
+    writeFileSync(oversized, '#N canvas 100 100 800 500 12;\n#X obj 20 20 print top;\n#X obj 20 20000 print bottom;\n');
+    await pd('pd', `open ${basename(oversized)} ${dirname(oversized)}`);
+    const oversizedGeneration = 'oversized-fixture-generation';
+    await until(async () => (await request(editPort, 'set_generation', { generation: oversizedGeneration, root_receiver: `pd-${basename(oversized)}` })).ok, 'oversized fixture registration');
+    const sentinelPng = join(exportDir, 'sentinel.png');
+    const sentinel = Buffer.from('previous-good-png-bytes');
+    writeFileSync(sentinelPng, sentinel);
+    const tooLarge = await request(editPort, 'export_canvas', { generation: oversizedGeneration, path: sentinelPng });
+    check(!tooLarge.ok && tooLarge.error.code === 'ExportTooLarge', 'oversized extent replies ExportTooLarge');
+    check(readFileSync(sentinelPng).equals(sentinel), 'ExportTooLarge preserves previous destination bytes');
+
+    // (e) atomic overwrite on success
+    await until(async () => (await request(editPort, 'set_generation', { generation: exportGeneration, root_receiver: exportReceiver })).ok, 'export fixture re-registration');
+    const overwritten = await request(editPort, 'export_canvas', { generation: exportGeneration, path: sentinelPng });
+    check(overwritten.ok === true && overwritten.data.status === 'saved', 'atomic overwrite export succeeds');
+    check(decodePng(readFileSync(sentinelPng)).width === rootPng.width, 'successful export replaces sentinel with valid png');
+    check(!readdirSync(exportDir).some((name) => name.includes('_temp')), 'no staging residue in destination directory');
+
+    // malformed scale and stale generation
+    const beforeBadScale = readFileSync(exportPng);
+    const badScale = await exportRequest({ scale: 5 });
+    check(!badScale.ok && badScale.error.code === 'InvalidRequest', 'scale 5 rejected as InvalidRequest');
+    check(readFileSync(exportPng).equals(beforeBadScale), 'invalid scale leaves existing export untouched');
+    const staleExport = await request(editPort, 'export_canvas', { generation: 'wrong-generation', path: exportPng });
+    check(!staleExport.ok && staleExport.error.code === 'StaleGeneration', 'stale generation export rejected');
+
+    const afterExports = await read(editPort, exportGeneration);
+    check(JSON.stringify(afterExports.records) === JSON.stringify(exportSnapshot.records), 'exports leave live structure unchanged');
+    evidence.export = {
+        root: { width: rootPng.width, height: rootPng.height, bytes: rootPngBytes.length },
+        scaled: { width: scaledPng.width, height: scaledPng.height },
+        child: { width: childDecoded.width, height: childDecoded.height },
+    };
     evidence.status = 'passed';
-    console.log(`managed applied=${applied.request_id} stale=${staleReply.request_id} pages=${pages.pages} largest=${pages.largest} pid=${child.pid}`);
+    console.log(`managed applied=${applied.request_id} stale=${staleReply.request_id} pages=${pages.pages} largest=${pages.largest} export=${rootPng.width}x${rootPng.height}@1x/${scaledPng.width}x${scaledPng.height}@2x pid=${child.pid}`);
 } catch (error) {
     evidence.failure = { message: String(error), stack: error.stack };
     console.error(error);

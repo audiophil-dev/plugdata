@@ -10,8 +10,25 @@ namespace pd {
 void setCanvasEditInterleaveHookForTesting(void (*hook)(void*), void* context);
 void setCanvasEditFailureHookForTesting(void (*hook)(void*), void* context);
 void setCanvasEditGuiMismatchHookForTesting(void (*hook)(void*), void* context);
+void setExportWriteFailureHookForTesting(void (*hook)(void*), void* context);
 }
 #endif
+
+// Test-only export drawable: a real Component (so the export extent can measure
+// it) that paints a known block through NVGComponent. Exercises the
+// Canvas::drawables branch of the authored extent without a product fixture.
+struct ExportTestDrawable final : public Component, public NVGComponent {
+    ExportTestDrawable() : NVGComponent(this) {}
+
+    void render(NVGcontext* nvg) override
+    {
+        nanovg::nvgBeginPath(nvg);
+        nanovg::nvgRect(nvg, static_cast<float>(getX()), static_cast<float>(getY()),
+            static_cast<float>(getWidth()), static_cast<float>(getHeight()));
+        nanovg::nvgFillColor(nvg, nanovg::nvgRGBA(0, 255, 0, 255));
+        nanovg::nvgFill(nvg);
+    }
+};
 
 class DirectDebugApiTest : public PlugDataUnitTest, private Timer
 {
@@ -78,6 +95,11 @@ private:
     }
 
     static void failAfterFirstCanvasAdd(void* context)
+    {
+        *static_cast<bool*>(context) = true;
+    }
+
+    static void failAtomicExportEncode(void* context)
     {
         *static_cast<bool*>(context) = true;
     }
@@ -196,30 +218,27 @@ private:
         return "#N canvas 100 100 300 200 12;\n#X obj 100 100 print export-target;\n";
     }
 
-    // Mirrors the implementation's content-region computation: union of the
-    // object bounds expanded by 24 px, mapped through the live canvas
-    // transform (before clipping to the editor).
-    Rectangle<int> exportMappedContentRegion(Canvas* canvas) const
+    // Maps a logical canvas-coordinate region into the exported output region
+    // for the given full-content bounds and scale.
+    static Rectangle<int> exportRegionFor(Rectangle<int> const& logicalRegion, Rectangle<int> const& bounds, int const scale)
     {
-        Rectangle<int> contentBounds;
-        bool hasContent = false;
-        for (auto const* object : canvas->objects) {
-            auto const bounds = object->getBounds();
-            contentBounds = hasContent ? contentBounds.getUnion(bounds) : bounds;
-            hasContent = true;
-        }
-        if (!hasContent)
-            return {};
-
-        contentBounds = contentBounds.expanded(24);
-        auto const topLeft = editor->getLocalPoint(canvas, contentBounds.getTopLeft());
-        auto const bottomRight = editor->getLocalPoint(canvas, contentBounds.getBottomRight());
-        return Rectangle<int>::leftTopRightBottom(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y);
+        return Rectangle<int>((logicalRegion.getX() - bounds.getX()) * scale,
+            (logicalRegion.getY() - bounds.getY()) * scale,
+            logicalRegion.getWidth() * scale, logicalRegion.getHeight() * scale);
     }
 
-    Rectangle<int> exportExpectedRegion(Canvas* canvas) const
+    static bool imageRegionHasContent(Image const& image, Rectangle<int> const& outputRegion, Colour const& background, int const tolerance = 24)
     {
-        return exportMappedContentRegion(canvas).getIntersection(editor->getLocalBounds());
+        auto const r = outputRegion.getIntersection(image.getBounds());
+        for (int y = r.getY(); y < r.getBottom(); ++y)
+            for (int x = r.getX(); x < r.getRight(); ++x) {
+                auto const p = image.getPixelAt(x, y);
+                if (std::abs(p.getRed() - background.getRed()) > tolerance
+                    || std::abs(p.getGreen() - background.getGreen()) > tolerance
+                    || std::abs(p.getBlue() - background.getBlue()) > tolerance)
+                    return true;
+            }
+        return false;
     }
 
     Canvas* openBoundExportFixture(String const& patchContent, String const& receiver)
@@ -275,12 +294,12 @@ private:
             "export clipped flag must match");
     }
 
-    void checkExportFile(File const& file, Rectangle<int> const& expectedLogical, String const& description)
+    Image checkExportFile(File const& file, Rectangle<int> const& expectedLogical, String const& description, int const scale = 1)
     {
         check(file.existsAsFile(), description + " must create the requested file");
         check(file.getSize() > 0, description + " file must be non-empty");
         if (!file.existsAsFile())
-            return;
+            return {};
 
         unsigned char const expectedMagic[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
         unsigned char magic[8] = {};
@@ -295,15 +314,15 @@ private:
         Image const decoded = PNGImageFormat().decodeImage(decodeStream);
         check(!decoded.isNull(), description + " file must decode as PNG");
         if (decoded.isNull())
-            return;
+            return {};
 
-        auto const renderScale = editor->getRenderScale();
-        int const expectedWidth = roundToInt(static_cast<float>(expectedLogical.getWidth()) * renderScale);
-        int const expectedHeight = roundToInt(static_cast<float>(expectedLogical.getHeight()) * renderScale);
+        int const expectedWidth = expectedLogical.getWidth() * scale;
+        int const expectedHeight = expectedLogical.getHeight() * scale;
         check(decoded.getWidth() == expectedWidth && decoded.getHeight() == expectedHeight,
-            description + " png dimensions must match the visible content region scaled by the render scale (expected "
+            description + " png dimensions must equal the logical extent times scale (expected "
                 + String(expectedWidth) + "x" + String(expectedHeight) + ", actual " + String(decoded.getWidth()) + "x"
                 + String(decoded.getHeight()) + ")");
+        return decoded;
     }
 
     void consoleBegin()
@@ -4537,13 +4556,20 @@ private:
             checkConsoleReply(0, 600, true, "");
             exportGeneration = "export-generation";
 
-            // Start from the patch origin at 100% zoom so the fixture object is
-            // deterministically inside the visible viewport.
+            // The exported dimensions must come from the full logical extent,
+            // never the editor viewport or device scale; pinning zoom proves the
+            // live view is irrelevant to the output.
             exportCanvas->restoreViewportState();
             check(std::abs(getValue<float>(exportCanvas->zoomScale) - 1.0f) < 0.001f,
                 "export fixture must be pinned at 100% zoom");
-            exportExpectedLogical = exportExpectedRegion(exportCanvas);
-            check(!exportExpectedLogical.isEmpty(), "export fixture object must be inside the visible viewport");
+            auto const bounds = exportCanvas->getExportBounds();
+            check(bounds.has_value() && !bounds->isEmpty(), "export fixture must have a full-content extent");
+            if (!bounds.has_value()) {
+                finishConsole();
+                break;
+            }
+            exportExpectedLogical = *bounds;
+            check(exportCanvas->objects.size() == 1, "the export fixture must have exactly one object");
 
             File const tempDir = File::getSpecialLocation(File::tempDirectory);
             exportTempFile = tempDir.getChildFile("plugdata-export-" + String(Time::currentTimeMillis()) + ".png");
@@ -4553,7 +4579,13 @@ private:
             sendRequest(makeExportCanvasRequest(601, exportGeneration, exportTempFile.getFullPathName()), 601, true, {});
             flushDebugQueue();
             checkExportSaved(0, false);
-            checkExportFile(exportTempFile, exportExpectedLogical, "export");
+            Image const exportImage = checkExportFile(exportTempFile, exportExpectedLogical, "export");
+            if (!exportImage.isNull() && exportCanvas->objects.size() == 1) {
+                auto const background = exportImage.getPixelAt(1, 1);
+                check(imageRegionHasContent(exportImage,
+                        exportRegionFor(exportCanvas->objects[0]->getBounds(), exportExpectedLogical, 1), background),
+                    "export png must contain the fixture object at its logical landmark");
+            }
 
             exportTempFileUpper = tempDir.getChildFile("plugdata-export-" + String(Time::currentTimeMillis()) + ".PNG");
             exportTempFileUpper.deleteFile();
@@ -4603,30 +4635,44 @@ private:
             startTimer(10);
             break;
         }
-        // (export) A live but non-displayed registered canvas is rejected.
+        // (export) A live but non-displayed registered canvas must still export
+        // its full content offscreen from the inactive background tab.
         case 33: {
+            // Opening another tab backgrounds the registered root. The old
+            // contract rejected non-displayed canvases; full-content offscreen
+            // export must now succeed for an existing inactive tab.
             hiddenExportCanvas = editor->getTabComponent().openPatch(makeFixturePatch());
-            check(hiddenExportCanvas != nullptr, "the hidden-canvas fixture must open");
+            check(hiddenExportCanvas != nullptr, "the background-tab fixture must open");
             if (hiddenExportCanvas)
                 hiddenExportCanvas->performSynchronise();
+            check(exportCanvas && !exportCanvas->isShowing(), "the registered root must be an inactive background tab");
 
             File const tempDir = File::getSpecialLocation(File::tempDirectory);
-            String const rejectedPath = tempDir.getChildFile("plugdata-export-hidden.png").getFullPathName();
-            File(rejectedPath).deleteFile();
+            File const inactiveFile = tempDir.getChildFile("plugdata-export-inactive-" + String(Time::currentTimeMillis()) + ".png");
+            inactiveFile.deleteFile();
+
+            auto const bounds = exportCanvas->getExportBounds();
+            check(bounds.has_value() && !bounds->isEmpty(), "the inactive root must still have a full-content extent");
 
             consoleBegin();
-            sendRequest(makeExportCanvasRequest(620, exportGeneration, rejectedPath), 620, false, "CanvasNotFound");
+            sendRequest(makeExportCanvasRequest(620, exportGeneration, inactiveFile.getFullPathName()), 620, true, {});
             flushDebugQueue();
-            checkConsoleReply(0, 620, false, "CanvasNotFound");
-            checkConsoleErrorMessage(0, "canvas is not currently displayed");
-            check(!File(rejectedPath).existsAsFile(), "hidden-canvas export must not create a file");
+            checkExportSaved(0, false);
+            Image const inactiveImage = checkExportFile(inactiveFile, bounds.value_or(Rectangle<int>()), "inactive-tab export");
+            if (!inactiveImage.isNull() && bounds.has_value() && exportCanvas->objects.size() == 1) {
+                auto const background = inactiveImage.getPixelAt(1, 1);
+                check(imageRegionHasContent(inactiveImage,
+                        exportRegionFor(exportCanvas->objects[0]->getBounds(), *bounds, 1), background),
+                    "inactive-tab export png must contain the fixture object landmark");
+            }
+            inactiveFile.deleteFile();
 
             if (hiddenExportCanvas) {
                 editor->getTabComponent().closeTab(hiddenExportCanvas);
                 hiddenExportCanvas = nullptr;
             }
 
-            std::cout << "[export] (c) hidden canvas rejected CanvasNotFound" << std::endl;
+            std::cout << "[export] (c) inactive background tab exported full content" << std::endl;
             consoleStep = 34;
             startTimer(10);
             break;
@@ -4672,9 +4718,9 @@ private:
             startTimer(10);
             break;
         }
-        // (export) Task 2 (g)/(f): a canvas with no objects and a canvas whose
-        // only object is outside the viewport both have an empty visible region
-        // and must be rejected before any rendering or file write.
+        // (export) Task 2 (g)/(f): a canvas with no determinable content fails
+        // ExportFailed, while content beyond the 8192 per-axis cap fails
+        // ExportTooLarge, both before any rendering or file write.
         case 35: {
             auto* zeroCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n", "export-zero-root");
             check(zeroCanvas != nullptr, "the zero-object export fixture must open");
@@ -4695,87 +4741,139 @@ private:
                 closeExportFixture(zeroCanvas, "export-zero-root");
             }
 
-            auto* farCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 20000 print far-target;\n", "export-far-root");
-            check(farCanvas != nullptr, "the offscreen-object export fixture must open");
+            auto* farCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 100 print near-target;\n#X obj 100 20000 print far-target;\n", "export-far-root");
+            check(farCanvas != nullptr, "the oversized export fixture must open");
             if (farCanvas) {
                 registerExportGeneration(642, "export-far-generation", "export-far-root");
-                check(exportExpectedRegion(farCanvas).isEmpty(), "the offscreen object must map outside the editor");
+
+                auto const farBounds = farCanvas->getExportBounds();
+                check(farBounds.has_value(), "the oversized fixture must still have a determinable extent");
+                check(farBounds.has_value() && farBounds->getHeight() > 8192,
+                    "the oversized fixture must breach the 8192 per-axis limit");
 
                 File const tempDir = File::getSpecialLocation(File::tempDirectory);
                 File const farFile = tempDir.getChildFile("plugdata-export-far-" + String(Time::currentTimeMillis()) + ".png");
                 farFile.deleteFile();
 
                 consoleBegin();
-                sendRequest(makeExportCanvasRequest(643, "export-far-generation", farFile.getFullPathName()), 643, false, "ExportFailed");
+                sendRequest(makeExportCanvasRequest(643, "export-far-generation", farFile.getFullPathName()), 643, false, "ExportTooLarge");
                 flushDebugQueue();
-                checkConsoleReply(0, 643, false, "ExportFailed");
-                checkConsoleErrorMessage(0, "canvas has no visible content");
-                check(!farFile.existsAsFile(), "offscreen export must not create a file");
+                checkConsoleReply(0, 643, false, "ExportTooLarge");
+                checkConsoleErrorMessage(0, "export exceeds the 8192 pixel per-axis limit");
+                check(!farFile.existsAsFile(), "oversized export must not create a file");
 
                 closeExportFixture(farCanvas, "export-far-root");
             }
 
-            std::cout << "[export] (g)+(f) empty visible region paths passed" << std::endl;
+            std::cout << "[export] (g)+(f) empty canvas and oversized extent paths passed" << std::endl;
             consoleStep = 36;
             startTimer(10);
             break;
         }
-        // (export) Task 2 (a)/(b): content that extends past the viewport is
-        // clipped to the visible intersection, and re-exporting to an existing
+        // (export) Task 2 (a)/(b): an under-cap far-separated patch exports its
+        // full content at a requested scale, and re-exporting to an existing
         // path replaces its contents.
         case 36: {
-            auto* clipCanvas = openBoundExportFixture(
-                "#N canvas 100 100 300 200 12;\n#X obj 100 100 print clip-top;\n#X obj 100 20000 print clip-bottom;\n",
-                "export-clip-root");
-            check(clipCanvas != nullptr, "the clipping export fixture must open");
-            if (clipCanvas) {
-                registerExportGeneration(650, "export-clip-generation", "export-clip-root");
+            // Under-cap far-separated content: both objects must appear on disk
+            // at their logical landmarks in one full-content image.
+            auto* farContentCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n#X obj 100 100 print near-target;\n#X obj 3000 100 print far-target;\n",
+                "export-farcontent-root");
+            check(farContentCanvas != nullptr, "the far-content export fixture must open");
+            if (farContentCanvas) {
+                registerExportGeneration(650, "export-farcontent-generation", "export-farcontent-root");
 
-                auto const mapped = exportMappedContentRegion(clipCanvas);
-                auto const visible = exportExpectedRegion(clipCanvas);
-                check(!visible.isEmpty(), "the clipping fixture must have a visible region");
-                check(visible != mapped, "the clipping fixture content must exceed the visible region");
+                auto const bounds = farContentCanvas->getExportBounds();
+                check(bounds.has_value() && !bounds->isEmpty(), "the far-content fixture must have a full-content extent");
+                check(bounds.has_value() && bounds->getWidth() > 2000, "the far-content fixture objects must be far apart");
+                check(bounds.has_value() && bounds->getWidth() <= 8192 && bounds->getHeight() <= 8192,
+                    "the far-content fixture must stay under the per-axis cap");
+                check(farContentCanvas->objects.size() == 2, "the far-content fixture must have two objects");
 
                 File const tempDir = File::getSpecialLocation(File::tempDirectory);
-                File const clipFile = tempDir.getChildFile("plugdata-export-clip-" + String(Time::currentTimeMillis()) + ".png");
-                clipFile.deleteFile();
+                File const farFile = tempDir.getChildFile("plugdata-export-farcontent-" + String(Time::currentTimeMillis()) + ".png");
+                farFile.deleteFile();
+
+                auto findLandmarks = [&farContentCanvas](Rectangle<int>& nearBounds, Rectangle<int>& farBounds) {
+                    for (auto const* object : farContentCanvas->objects) {
+                        if (object->getObjectBounds().getX() < 1000)
+                            nearBounds = object->getBounds();
+                        else
+                            farBounds = object->getBounds();
+                    }
+                };
 
                 consoleBegin();
-                sendRequest(makeExportCanvasRequest(651, "export-clip-generation", clipFile.getFullPathName()), 651, true, {});
+                sendRequest(makeExportCanvasRequest(651, "export-farcontent-generation", farFile.getFullPathName()), 651, true, {});
                 flushDebugQueue();
-                checkExportSaved(0, true);
-                checkExportFile(clipFile, visible, "clipped export");
-                int64 const clippedSize = clipFile.getSize();
-                int const clippedHeight = visible.getHeight();
+                checkExportSaved(0, false);
+                Image const farImage = checkExportFile(farFile, bounds.value_or(Rectangle<int>()), "far-content export");
+                if (!farImage.isNull() && bounds.has_value()) {
+                    auto const background = farImage.getPixelAt(1, 1);
+                    Rectangle<int> nearBounds;
+                    Rectangle<int> farBounds;
+                    findLandmarks(nearBounds, farBounds);
+                    check(imageRegionHasContent(farImage, exportRegionFor(nearBounds, *bounds, 1), background),
+                        "far-content png must contain the near object landmark");
+                    check(imageRegionHasContent(farImage, exportRegionFor(farBounds, *bounds, 1), background),
+                        "far-content png must contain the far object landmark (~2900 units away)");
+                }
+                int64 const farSize = farFile.getSize();
 
-                closeExportFixture(clipCanvas, "export-clip-root");
+                // scale=2 must double both dimensions while the requested scale
+                // remains the only multiplier over the logical extent.
+                File const scaledFile = tempDir.getChildFile("plugdata-export-farcontent-2x-" + String(Time::currentTimeMillis()) + ".png");
+                scaledFile.deleteFile();
+                consoleBegin();
+                auto scaledRequest = makeExportCanvasRequest(652, "export-farcontent-generation", scaledFile.getFullPathName());
+                scaledRequest.getDynamicObject()->setProperty("scale", 2);
+                sendRequest(scaledRequest, 652, true, {});
+                flushDebugQueue();
+                checkExportSaved(0, false);
+                if (bounds.has_value()) {
+                    Image const scaledImage = checkExportFile(scaledFile, *bounds, "far-content 2x export", 2);
+                    if (!scaledImage.isNull()) {
+                        auto const background = scaledImage.getPixelAt(1, 1);
+                        Rectangle<int> nearBounds;
+                        Rectangle<int> farBounds;
+                        findLandmarks(nearBounds, farBounds);
+                        check(imageRegionHasContent(scaledImage, exportRegionFor(nearBounds, *bounds, 2), background),
+                            "2x far-content png must contain the near object landmark at doubled coordinates");
+                        check(imageRegionHasContent(scaledImage, exportRegionFor(farBounds, *bounds, 2), background),
+                            "2x far-content png must contain the far object landmark at doubled coordinates");
+                    }
+                }
+                scaledFile.deleteFile();
 
-                // (b) Overwrite: a second export to the same path with shorter
-                // content must replace the file; an appending writer would leave
-                // the tall png first and the short one trailing.
+                closeExportFixture(farContentCanvas, "export-farcontent-root");
+
+                // Overwrite: re-exporting a shorter patch to the same path must
+                // replace the taller file rather than append to it.
                 auto* overwriteCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n#X obj 100 100 print overwrite-target;\n", "export-overwrite-root");
                 check(overwriteCanvas != nullptr, "the overwrite export fixture must open");
                 if (overwriteCanvas) {
-                    registerExportGeneration(652, "export-overwrite-generation", "export-overwrite-root");
-                    auto const overwriteRegion = exportExpectedRegion(overwriteCanvas);
-                    check(!overwriteRegion.isEmpty(), "the overwrite fixture must have a visible region");
-                    check(overwriteRegion.getHeight() < clippedHeight, "the overwrite fixture must be shorter than the clipped fixture");
+                    registerExportGeneration(653, "export-overwrite-generation", "export-overwrite-root");
+                    auto const overwriteBounds = overwriteCanvas->getExportBounds();
+                    check(overwriteBounds.has_value() && !overwriteBounds->isEmpty(), "the overwrite fixture must have an extent");
+                    check(overwriteBounds.has_value() && overwriteBounds->getWidth() < (bounds.has_value() ? bounds->getWidth() : 0),
+                        "the overwrite fixture must be narrower than the far-content fixture");
 
                     consoleBegin();
-                    sendRequest(makeExportCanvasRequest(653, "export-overwrite-generation", clipFile.getFullPathName()), 653, true, {});
+                    sendRequest(makeExportCanvasRequest(654, "export-overwrite-generation", farFile.getFullPathName()), 654, true, {});
                     flushDebugQueue();
                     checkExportSaved(0, false);
-                    checkExportFile(clipFile, overwriteRegion, "overwrite export");
-                    check(clipFile.getSize() < clippedSize,
+                    if (overwriteBounds.has_value())
+                        checkExportFile(farFile, *overwriteBounds, "overwrite export");
+                    check(farFile.getSize() < farSize,
                         "overwrite export must replace the previous file instead of appending to it");
 
-                    if (clipFile.existsAsFile())
-                        clipFile.deleteFile();
+                    if (farFile.existsAsFile())
+                        farFile.deleteFile();
                     closeExportFixture(overwriteCanvas, "export-overwrite-root");
                 }
             }
 
-            std::cout << "[export] (a)+(b) clipping and overwrite passed" << std::endl;
+            std::cout << "[export] (a)+(b) full-content far export, 2x scale and overwrite passed" << std::endl;
             consoleStep = 37;
             startTimer(10);
             break;
@@ -4863,6 +4961,893 @@ private:
             }
 
             std::cout << "[export] (c)+(d) stale generation and closed canvas passed" << std::endl;
+            consoleStep = 39;
+            startTimer(10);
+            break;
+        }
+        case 39: {
+            beginTest("Export request and canvas selection");
+            allPassed = true;
+            File const output = File::getSpecialLocation(File::tempDirectory)
+                .getChildFile("plugdata-export-selection-" + String(Time::currentTimeMillis()) + ".png");
+            output.deleteFile();
+            auto* root = openBoundExportFixture("#N canvas 100 100 300 200 12;\n"
+                "#N canvas 0 0 220 140 child 0;\n#X restore 30 30 pd child;\n", "export-selection-root");
+            check(root != nullptr, "selection root must open");
+            if (root) {
+                registerExportGeneration(690, "export-selection-generation", "export-selection-root");
+                pd::Patch::Ptr childPatch;
+                editor->pd->lockAudioThread();
+                if (auto* object = root->patch.getRawPointer()->gl_list;
+                    object && pd_class(&object->g_pd) == canvas_class)
+                    childPatch = new pd::Patch(pd::WeakReference(reinterpret_cast<t_canvas*>(object), editor->pd), editor->pd, false);
+                editor->pd->unlockAudioThread();
+
+                auto sendExport = [&](int id, var request, String const& code) {
+                    consoleBegin();
+                    sendRequest(request, id, false, code);
+                    flushDebugQueue();
+                    check(responses.size() == 1, "selection export must reply exactly once");
+                    checkConsoleReply(0, id, false, code);
+                    std::cout << "[export-selection] " << id << " " << JSON::toString(responses.isEmpty() ? var() : responses[0], true) << std::endl;
+                    check(!output.existsAsFile(), "rejected selection export must not write png");
+                };
+                auto request = [&](int id) { return makeExportCanvasRequest(id, "export-selection-generation", output.getFullPathName()); };
+                auto* child = childPatch ? editor->getTabComponent().openPatch(childPatch, false, true) : nullptr;
+                check(child != nullptr, "selection child must have an existing tab Canvas");
+                if (child) {
+                    child->performSynchronise();
+                    editor->getTabComponent().showTab(root, 0);
+                    check(!child->isShowing(), "selection child must be an inactive tab");
+                    auto valid = request(691);
+                    valid.getDynamicObject()->setProperty("canvas_path", var(Array<var> { var(0) }));
+                    valid.getDynamicObject()->setProperty("scale", 4);
+                    sendExport(691, valid, "ExportFailed");
+                    checkConsoleErrorMessage(0, "canvas has no visible content");
+                    editor->getTabComponent().closeTab(child);
+                    valid.getDynamicObject()->setProperty("request_id", 692);
+                    sendExport(692, valid, "CanvasNotFound");
+                    checkConsoleErrorMessage(0, "canvas is not instantiated");
+                }
+                auto invalid = [&](int id, String field, var value) {
+                    auto r = request(id);
+                    r.getDynamicObject()->setProperty(field, value);
+                    sendExport(id, r, "InvalidRequest");
+                };
+                invalid(693, "scale", true);
+                invalid(694, "scale", 1.5);
+                invalid(695, "scale", 0);
+                invalid(696, "scale", 5);
+                invalid(697, "canvas_path", var(Array<var> { var(true) }));
+                invalid(698, "canvas_path", var(Array<var> { var(0.5) }));
+                invalid(699, "canvas_path", var(Array<var> { var(-1) }));
+                Array<var> deepPath;
+                for (int i = 0; i < 33; ++i) deepPath.add(0);
+                invalid(700, "canvas_path", var(deepPath));
+                invalid(701, "extra", 1);
+                auto missing = request(702);
+                missing.getDynamicObject()->setProperty("canvas_path", var(Array<var> { var(10) }));
+                sendExport(702, missing, "CanvasNotFound");
+                auto stale = request(703);
+                stale.getDynamicObject()->setProperty("generation", "stale-selection-generation");
+                sendExport(703, stale, "StaleGeneration");
+                closeExportFixture(root, "export-selection-root");
+            }
+            auto* pluginFixture = openBoundExportFixture("#N canvas 100 100 300 200 12;\n", "export-selection-plugin");
+            check(pluginFixture != nullptr, "plugin selection fixture must open");
+            if (pluginFixture) {
+                auto patch = pluginFixture->refCountedPatch;
+                auto* relocated = editor->getTabComponent().createNewWindow(pluginFixture);
+                auto* modeEditor = relocated ? relocated->editor : nullptr;
+                check(modeEditor != nullptr, "plugin selection fixture must have its own editor");
+                if (modeEditor) {
+                    modeEditor->getTabComponent().openInPluginMode(patch);
+                    modeEditor->getTabComponent().updateNow();
+                    check(modeEditor->getPluginModeCanvas() && modeEditor->getCanvases().empty(),
+                        "plugin selection Canvas must be separately owned");
+                    registerExportGeneration(704, "export-selection-plugin-generation", "export-selection-plugin");
+                    consoleBegin();
+                    sendRequest(makeExportCanvasRequest(705, "export-selection-plugin-generation", output.getFullPathName()),
+                        705, false, "ExportFailed");
+                    flushDebugQueue();
+                    checkConsoleReply(0, 705, false, "ExportFailed");
+                    checkConsoleErrorMessage(0, "canvas has no visible content");
+                    std::cout << "[export-selection] 705 " << JSON::toString(responses.isEmpty() ? var() : responses[0], true) << std::endl;
+                    check(!output.existsAsFile(), "plugin selection must not write an empty canvas");
+                    patch->openInPluginMode = false;
+                    modeEditor->getTabComponent().updateNow();
+                    for (auto* canvas : modeEditor->getCanvases()) {
+                        if (canvas->refCountedPatch == patch) {
+                            modeEditor->pd->lockAudioThread();
+                            if (auto* native = patch->getRawPointer())
+                                pd_unbind(&native->gl_obj.ob_pd, modeEditor->pd->generateSymbol("export-selection-plugin"));
+                            modeEditor->pd->unlockAudioThread();
+                            modeEditor->getTabComponent().closeTab(canvas);
+                            break;
+                        }
+                    }
+                    if (auto* window = dynamic_cast<PlugDataWindow*>(modeEditor->getTopLevelComponent()))
+                        window->closeButtonPressed();
+                }
+            }
+            consoleStep = 40;
+            startTimer(10);
+            break;
+        }
+        // (export) Task 2: a dedicated offscreen target renders known geometry,
+        // completes, and reads back exact corner colours at an odd size, while
+        // the live editor surface is unchanged. This proves the target-specific
+        // readback path on the backend the suite actually runs (Metal on macOS).
+        case 40: {
+            beginTest("Offscreen target readback");
+            allPassed = true;
+
+            auto* surface = &editor->nvgSurface;
+            check(surface->makeContextActive(), "offscreen readback requires an active NVG context");
+
+            auto const maxTextureSize = surface->getMaxTextureSize();
+            check(maxTextureSize > 0, "the backend must report a maximum texture size");
+            std::cout << "[offscreen] backend max texture size=" << maxTextureSize << std::endl;
+
+            // Capture a region of the live editor surface before the offscreen
+            // render so we can prove it is untouched afterwards.
+            auto const probeArea = editor->getLocalBounds().withSizeKeepingCentre(64, 48);
+            Image const before = surface->renderToImage(probeArea);
+            check(!before.isNull(), "the live editor surface must be readable before the offscreen render");
+
+            constexpr int targetWidth = 257;
+            constexpr int targetHeight = 131;
+
+            bool tooLarge = false;
+            Image const offscreen = surface->renderOffscreenImage(targetWidth, targetHeight,
+                [](NVGcontext* nvg) {
+                    nanovg::nvgBeginFrame(nvg, 257.0f, 131.0f, 1.0f);
+                    nanovg::nvgBeginPath(nvg);
+                    nanovg::nvgRect(nvg, 0, 0, 128.5f, 65.5f);
+                    nanovg::nvgFillColor(nvg, nanovg::nvgRGBA(255, 0, 0, 255));
+                    nanovg::nvgFill(nvg);
+                    nanovg::nvgBeginPath(nvg);
+                    nanovg::nvgRect(nvg, 128.5f, 65.5f, 128.5f, 65.5f);
+                    nanovg::nvgFillColor(nvg, nanovg::nvgRGBA(0, 0, 255, 255));
+                    nanovg::nvgFill(nvg);
+                    // A standalone pass must set its own scissor: nvgBeginFrame
+                    // resets globalScissor to empty, exactly like the GridOnParent pass.
+                    nanovg::nvgGlobalScissor(nvg, 0, 0, 257, 131);
+                    nanovg::nvgEndFrame(nvg);
+                }, tooLarge);
+
+            check(!tooLarge, "an under-limit offscreen target must not be rejected as too large");
+            check(!offscreen.isNull(), "the offscreen target must render and read back");
+            if (!offscreen.isNull()) {
+                check(offscreen.getWidth() == targetWidth && offscreen.getHeight() == targetHeight,
+                    "offscreen image must have the exact requested odd dimensions (expected "
+                        + String(targetWidth) + "x" + String(targetHeight) + ", actual "
+                        + String(offscreen.getWidth()) + "x" + String(offscreen.getHeight()) + ")");
+
+                auto const topLeft = offscreen.getPixelAt(0, 0);
+                auto const bottomRight = offscreen.getPixelAt(targetWidth - 1, targetHeight - 1);
+                check(topLeft.getRed() > 200 && topLeft.getGreen() < 60 && topLeft.getBlue() < 60,
+                    "offscreen top-left corner must be red (actual " + topLeft.toString() + ")");
+                check(bottomRight.getBlue() > 200 && bottomRight.getRed() < 60 && bottomRight.getGreen() < 60,
+                    "offscreen bottom-right corner must be blue (actual " + bottomRight.toString() + ")");
+            }
+
+            // The live editor surface must be byte-identical after the offscreen
+            // render: no bind theft, resize or viewport change.
+            Image const after = surface->renderToImage(probeArea);
+            check(!after.isNull(), "the live editor surface must still be readable after the offscreen render");
+            bool unchanged = !before.isNull() && !after.isNull()
+                && before.getWidth() == after.getWidth() && before.getHeight() == after.getHeight();
+            if (unchanged) {
+                for (int y = 0; y < before.getHeight() && unchanged; ++y) {
+                    for (int x = 0; x < before.getWidth(); ++x) {
+                        if (before.getPixelAt(x, y) != after.getPixelAt(x, y)) {
+                            unchanged = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            check(unchanged, "the live editor surface must be unchanged after an offscreen render");
+
+            // Over-limit requests must be rejected before allocating.
+            bool overLimitTooLarge = false;
+            Image const overLimit = surface->renderOffscreenImage(maxTextureSize + 1, 16,
+                [](NVGcontext* nvg) { nanovg::nvgBeginFrame(nvg, 1.0f, 1.0f, 1.0f); nanovg::nvgEndFrame(nvg); },
+                overLimitTooLarge);
+            check(overLimitTooLarge, "an over-limit offscreen axis must be rejected as too large");
+            check(overLimit.isNull(), "an over-limit offscreen request must not produce an image");
+
+            std::cout << "[offscreen] target readback passed size=" << targetWidth << "x" << targetHeight
+                      << " maxTextureSize=" << maxTextureSize << std::endl;
+            consoleStep = 41;
+            startTimer(10);
+            break;
+        }
+        // (export) Task 3: Canvas::getExportBounds()/renderForExport() must
+        // include every authored geometry source (object bodies, labels wider
+        // than their object, connection cords that bend below the objects, and
+        // drawables) plus the 24-unit margin, independent of viewport/zoom, and
+        // draw chrome-free. Pixel landmarks are read back through the real
+        // offscreen target at 1 logical pixel per canvas unit.
+        case 41: {
+            beginTest("Export authored bounds and chrome");
+            allPassed = true;
+
+            // Two small objects ~600 logical units apart (A top-left, B far
+            // right), a third at the bottom-left corner, a label on B wider than
+            // its 16px body, and a cord that bends well below every object.
+            auto* canvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n"
+                "#X obj 100 100 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n"
+                "#X obj 700 100 bng 15 250 50 0 empty empty export_long_label_text_probe 20 20 0 10 #fcfcfc #000000 #000000;\n"
+                "#X obj 100 500 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n"
+                "#X connect 0 0 1 0;\n",
+                "export-bounds-root");
+            check(canvas != nullptr, "the authored-bounds fixture must open");
+            if (!canvas) {
+                finishConsole();
+                break;
+            }
+
+            // (c) Construction-time chrome absence: clear any selection so the
+            // export draw cannot include selection outlines or resize handles.
+            canvas->deselectAll(false);
+            check(canvas->getLassoSelection().getNumSelected() == 0,
+                "no selection may be active during the export draw");
+
+            check(canvas->objects.size() == 3, "the fixture must create exactly three objects");
+            check(canvas->connections.size() == 1, "the fixture must create exactly one cord");
+            if (canvas->objects.size() != 3 || canvas->connections.size() != 1) {
+                closeExportFixture(canvas, "export-bounds-root");
+                finishConsole();
+                break;
+            }
+
+            auto* labelObject = canvas->objects[1];
+            check(labelObject->gui && !labelObject->gui->labels.isEmpty(),
+                "the far object must expose a label");
+            ObjectLabel* label = (labelObject->gui && !labelObject->gui->labels.isEmpty())
+                ? labelObject->gui->labels[0]
+                : nullptr;
+            check(label != nullptr && label->isVisible(), "the far object's label must be visible");
+            if (label)
+                check(label->getWidth() > labelObject->getObjectBounds().getWidth(),
+                    "the label must be wider than its object body");
+
+            // Force a deterministic bend that dips below every object body so the
+            // connection geometry is a genuine contributor to the extent.
+            auto* cord = canvas->connections[0];
+            Rectangle<int> objectUnion;
+            for (auto const* object : canvas->objects)
+                objectUnion = objectUnion.isEmpty() ? object->getBounds() : objectUnion.getUnion(object->getBounds());
+            cord->addCorner(Point<float>(static_cast<float>(canvas->canvasOrigin.x + 400),
+                static_cast<float>(objectUnion.getBottom() + 60)));
+            check(cord->getNumCorners() >= 1, "the cord must have a real bend after adding a corner");
+
+            check(objectUnion.getWidth() >= 600,
+                "the two far objects must be at least 600 logical units apart (actual "
+                    + String(objectUnion.getWidth()) + ")");
+            check(cord->getBounds().getBottom() > objectUnion.getBottom(),
+                "the authored cord must dip below every object body");
+
+            Rectangle<int> labelUnion;
+            for (auto const* object : canvas->objects) {
+                if (!object->gui)
+                    continue;
+                for (auto const* l : object->gui->labels) {
+                    if (l && l->isVisible())
+                        labelUnion = labelUnion.isEmpty() ? l->getBounds() : labelUnion.getUnion(l->getBounds());
+                }
+            }
+
+            // (a) Extent correctness: every authored source is contained and the
+            // 24-unit margin is present on every side.
+            auto const exportBounds = canvas->getExportBounds();
+            check(exportBounds.has_value(), "a populated canvas must yield an export extent");
+            if (exportBounds.has_value()) {
+                auto const& b = *exportBounds;
+                for (auto const* object : canvas->objects)
+                    check(b.contains(object->getBounds()), "export bounds must contain every object body");
+                check(labelUnion.isEmpty() || b.contains(labelUnion), "export bounds must contain the wide label");
+                check(b.contains(cord->getBounds()), "export bounds must contain the bent cord");
+                check(b.getX() == objectUnion.getX() - 24 || b.getX() == labelUnion.getX() - 24,
+                    "export bounds must carry the 24-unit left margin");
+                check(b.getY() == objectUnion.getY() - 24, "export bounds must carry the 24-unit top margin");
+                check(b.getRight() >= objectUnion.getRight() + 24 || (!labelUnion.isEmpty() && b.getRight() >= labelUnion.getRight() + 24),
+                    "export bounds must carry the 24-unit right margin");
+                check(b.getBottom() == jmax(objectUnion.getBottom(), cord->getBounds().getBottom()) + 24,
+                    "export bounds must carry the 24-unit bottom margin");
+            }
+
+            // (b) Pixel landmarks through the real offscreen target. The draw
+            // renders at exactly one pixel per logical canvas unit.
+            if (exportBounds.has_value()) {
+                auto const& b = *exportBounds;
+
+                auto* surface = &editor->nvgSurface;
+                bool tooLarge = false;
+                Image const image = surface->renderOffscreenImage(b.getWidth(), b.getHeight(),
+                    [canvas, b](NVGcontext* nvg) {
+                        nanovg::nvgBeginFrame(nvg, static_cast<float>(b.getWidth()), static_cast<float>(b.getHeight()), 1.0f);
+                        canvas->renderForExport(nvg, b);
+                        // A standalone pass must set its own scissor before end.
+                        nanovg::nvgGlobalScissor(nvg, 0, 0, b.getWidth(), b.getHeight());
+                        nanovg::nvgEndFrame(nvg);
+                    }, tooLarge);
+
+                check(!tooLarge, "the authored-bounds export must stay under the texture limit");
+                check(!image.isNull(), "the authored-bounds offscreen render must read back");
+                if (!image.isNull()) {
+                    check(image.getWidth() == b.getWidth() && image.getHeight() == b.getHeight(),
+                        "export image dimensions must equal the logical extent (expected "
+                            + String(b.getWidth()) + "x" + String(b.getHeight()) + ", actual "
+                            + String(image.getWidth()) + "x" + String(image.getHeight()) + ")");
+
+                    // Margin pixel is pure theme background; use it as the reference
+                    // so the assertion is independent of which theme is active.
+                    auto const background = image.getPixelAt(2, 2);
+
+                    auto regionHasContent = [&image, background](Rectangle<int> const& outputRegion) {
+                        auto const r = outputRegion.getIntersection(image.getBounds());
+                        for (int y = r.getY(); y < r.getBottom(); ++y) {
+                            for (int x = r.getX(); x < r.getRight(); ++x) {
+                                auto const p = image.getPixelAt(x, y);
+                                if (std::abs(p.getRed() - background.getRed()) > 24
+                                    || std::abs(p.getGreen() - background.getGreen()) > 24
+                                    || std::abs(p.getBlue() - background.getBlue()) > 24) {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    };
+
+                    auto const toOutput = [&b](Rectangle<int> const& canvasRect) {
+                        return canvasRect.translated(-b.getX(), -b.getY());
+                    };
+
+                    Rectangle<int> aBounds;
+                    Rectangle<int> farBounds;
+                    Rectangle<int> cornerBounds;
+                    for (auto const* object : canvas->objects) {
+                        auto const pd = object->getObjectBounds();
+                        if (pd.getX() < 200)
+                            aBounds = object->getBounds();
+                        if (pd.getX() > 600)
+                            farBounds = object->getBounds();
+                        if (pd.getY() > 400)
+                            cornerBounds = object->getBounds();
+                    }
+
+                    check(regionHasContent(toOutput(aBounds)),
+                        "non-background pixels must appear at the near object landmark");
+                    check(regionHasContent(toOutput(farBounds)),
+                        "non-background pixels must appear at the far object landmark (~600 units away)");
+                    check(regionHasContent(toOutput(cornerBounds)),
+                        "non-background pixels must appear at the bottom-left corner object landmark");
+
+                    // Background between the two far-apart objects (the cord bends
+                    // below this band) proves no chrome spans the gap.
+                    auto const aCentre = aBounds.getCentre();
+                    auto const farCentre = farBounds.getCentre();
+                    Rectangle<int> gap((aCentre.x + farCentre.x) / 2 - 6,
+                        (aCentre.y + farCentre.y) / 2 - 6, 12, 12);
+                    bool gapIsBackground = true;
+                    auto const gapOutput = toOutput(gap).getIntersection(image.getBounds());
+                    for (int y = gapOutput.getY(); y < gapOutput.getBottom() && gapIsBackground; ++y)
+                        for (int x = gapOutput.getX(); x < gapOutput.getRight(); ++x) {
+                            auto const p = image.getPixelAt(x, y);
+                            if (std::abs(p.getRed() - background.getRed()) > 24
+                                || std::abs(p.getGreen() - background.getGreen()) > 24
+                                || std::abs(p.getBlue() - background.getBlue()) > 24) {
+                                gapIsBackground = false;
+                                break;
+                            }
+                        }
+                    check(gapIsBackground, "background must show between the far-apart objects (no chrome)");
+
+                    std::cout << "[export-bounds] image=" << image.getWidth() << "x" << image.getHeight()
+                              << " logical=" << b.getWidth() << "x" << b.getHeight()
+                              << " background=" << background.toString() << std::endl;
+                }
+            }
+
+            // (d) An empty canvas has no determinable extent and must fail typed,
+            // not fabricate a zero or cropped image.
+            auto* emptyCanvas = openBoundExportFixture("#N canvas 100 100 300 200 12;\n", "export-bounds-empty");
+            check(emptyCanvas != nullptr, "the empty export fixture must open");
+            if (emptyCanvas) {
+                auto const emptyBounds = emptyCanvas->getExportBounds();
+                check(!emptyBounds.has_value(), "an empty canvas must return no export extent");
+                std::cout << "[export-bounds] empty canvas hasExtent="
+                          << (emptyBounds.has_value() ? 1 : 0) << std::endl;
+                closeExportFixture(emptyCanvas, "export-bounds-empty");
+            }
+
+            closeExportFixture(canvas, "export-bounds-root");
+            std::cout << "[export-bounds] authored bounds and chrome passed" << std::endl;
+            consoleStep = 42;
+            startTimer(10);
+            break;
+        }
+        // (export) Task 5: PNG publication is atomic. A failing export must
+        // never truncate or delete a previously saved destination, and a
+        // successful export must replace it with a decodable PNG while leaving
+        // no staging file in the destination directory.
+        case 42: {
+            beginTest("Export atomic destination");
+            allPassed = true;
+
+            auto* atomicCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n#X obj 100 100 print atomic-target;\n",
+                "export-atomic-root");
+            check(atomicCanvas != nullptr, "the atomic export fixture must open");
+            if (!atomicCanvas) {
+                finishConsole();
+                break;
+            }
+            registerExportGeneration(710, "export-atomic-generation", "export-atomic-root");
+            auto const atomicBounds = atomicCanvas->getExportBounds();
+            check(atomicBounds.has_value() && !atomicBounds->isEmpty(), "the atomic fixture must have an extent");
+
+            File const tempDir = File::getSpecialLocation(File::tempDirectory);
+            File const dest = tempDir.getChildFile("plugdata-export-atomic-" + String(Time::currentTimeMillis()) + ".png");
+
+            String const sentinel = "PREVIOUS-GOOD-EXPORT-SENTINEL-BYTES-0123456789";
+            auto readBytes = [](File const& f) {
+                MemoryBlock block;
+                return f.loadFileAsData(block) ? block : MemoryBlock();
+            };
+            auto stagingResidue = [&dest] {
+                return dest.getParentDirectory().findChildFiles(
+                    File::findFiles, false,
+                    dest.getFileNameWithoutExtension() + "_temp*" + dest.getFileExtension()).size();
+            };
+            auto writeSentinel = [&dest, &sentinel] { return dest.replaceWithText(sentinel); };
+
+            // (a) Success: staging + rename replaces a preexisting file with a
+            // decodable PNG of the full-content dimensions and leaves no temp.
+            check(writeSentinel(), "the atomic destination must be writable");
+            check(dest.getSize() == static_cast<int64>(sentinel.length()), "the sentinel must start at its exact byte length");
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(711, "export-atomic-generation", dest.getFullPathName()), 711, true, {});
+            flushDebugQueue();
+            checkExportSaved(0, false);
+            if (atomicBounds.has_value())
+                checkExportFile(dest, *atomicBounds, "atomic overwrite export");
+            check(stagingResidue() == 0, "a successful export must leave no staging file");
+
+            // (b) A forced encode failure after the staging file is written must
+            // delete the staging file and preserve the previous destination.
+            check(writeSentinel(), "the atomic destination must be rewritable");
+            MemoryBlock const beforeEncodeFailure = readBytes(dest);
+            check(beforeEncodeFailure.getSize() == sentinel.length(), "the sentinel bytes must be restored exactly");
+            bool encodeFailureFired = false;
+            pd::setExportWriteFailureHookForTesting(failAtomicExportEncode, &encodeFailureFired);
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(712, "export-atomic-generation", dest.getFullPathName()), 712, false, "ExportFailed");
+            flushDebugQueue();
+            pd::setExportWriteFailureHookForTesting(nullptr, nullptr);
+            check(encodeFailureFired, "the injected encode failure hook must have fired");
+            checkConsoleReply(0, 712, false, "ExportFailed");
+            checkConsoleErrorMessage(0, "failed to write png file");
+            check(readBytes(dest) == beforeEncodeFailure, "an encode failure must preserve the previous destination byte-for-byte");
+            check(stagingResidue() == 0, "an encode failure must leave no staging file");
+
+            // (c) An unwritable destination directory must fail without touching
+            // the file it already contains.
+            File const lockedDir = tempDir.getChildFile("plugdata-export-atomic-locked-" + String(Time::currentTimeMillis()));
+            check(lockedDir.createDirectory(), "the locked export directory must be creatable");
+            File const lockedDest = lockedDir.getChildFile("out.png");
+            check(lockedDest.replaceWithText(sentinel), "the locked destination must be writable before locking");
+            MemoryBlock const beforeLocked = readBytes(lockedDest);
+            lockedDir.setReadOnly(true);
+            bool const locked = !lockedDir.hasWriteAccess();
+            if (locked) {
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(713, "export-atomic-generation", lockedDest.getFullPathName()), 713, false, "ExportFailed");
+                flushDebugQueue();
+                checkConsoleReply(0, 713, false, "ExportFailed");
+                check(readBytes(lockedDest) == beforeLocked, "an unwritable-directory export must preserve the destination byte-for-byte");
+            } else {
+                std::cout << "[export-atomic] skipped unwritable-directory case (process permissions are not restrictive)" << std::endl;
+            }
+            lockedDir.setReadOnly(false);
+            lockedDest.deleteFile();
+            lockedDir.deleteRecursively();
+
+            // (d) A too-large request against the same destination preserves it.
+            auto* farCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n#X obj 100 100 print near-target;\n#X obj 100 20000 print far-target;\n",
+                "export-atomic-far-root");
+            check(farCanvas != nullptr, "the atomic oversized fixture must open");
+            if (farCanvas) {
+                registerExportGeneration(714, "export-atomic-far-generation", "export-atomic-far-root");
+                check(writeSentinel(), "the atomic destination must be rewritable for the oversized request");
+                MemoryBlock const beforeTooLarge = readBytes(dest);
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(715, "export-atomic-far-generation", dest.getFullPathName()), 715, false, "ExportTooLarge");
+                flushDebugQueue();
+                checkConsoleReply(0, 715, false, "ExportTooLarge");
+                check(readBytes(dest) == beforeTooLarge, "a too-large export must preserve the previous destination byte-for-byte");
+                check(stagingResidue() == 0, "a too-large export must leave no staging file");
+                closeExportFixture(farCanvas, "export-atomic-far-root");
+            }
+
+            dest.deleteFile();
+            closeExportFixture(atomicCanvas, "export-atomic-root");
+
+            std::cout << "[export-atomic] success_replace=ok encode_failure=preserved too_large=preserved unwritable="
+                      << (locked ? "preserved" : "skipped") << " staging_residue=0" << std::endl;
+            consoleStep = 43;
+            startTimer(10);
+            break;
+        }
+        // (export) Final Wave F2#1/F4 IS-1: an export drawn while an object and a
+        // cord are live-selected must be chrome-free - pixel-identical to the
+        // unselected export - and must leave the live selection intact.
+        case 43: {
+            beginTest("Export selection chrome suppression");
+            allPassed = true;
+
+            auto* canvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n"
+                "#X obj 100 100 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n"
+                "#X obj 400 100 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n"
+                "#X connect 0 0 1 0;\n",
+                "export-chrome-root");
+            check(canvas != nullptr, "the selection-chrome fixture must open");
+            if (!canvas) {
+                finishConsole();
+                break;
+            }
+
+            auto const bounds = canvas->getExportBounds();
+            check(bounds.has_value() && !bounds->isEmpty(), "the selection-chrome fixture must have an extent");
+            check(canvas->objects.size() == 2 && canvas->connections.size() == 1,
+                "the selection-chrome fixture must have two objects and one cord");
+            if (!bounds.has_value() || canvas->objects.size() != 2 || canvas->connections.size() != 1) {
+                closeExportFixture(canvas, "export-chrome-root");
+                finishConsole();
+                break;
+            }
+
+            canvas->deselectAll(false);
+            check(canvas->getLassoSelection().getNumSelected() == 0, "the chrome fixture must start unselected");
+
+            auto* surface = &editor->nvgSurface;
+            auto renderExport = [surface, canvas, b = *bounds]() {
+                bool tooLarge = false;
+                return surface->renderOffscreenImage(b.getWidth(), b.getHeight(),
+                    [canvas, b](NVGcontext* nvg) {
+                        nanovg::nvgBeginFrame(nvg, static_cast<float>(b.getWidth()), static_cast<float>(b.getHeight()), 1.0f);
+                        canvas->renderForExport(nvg, b);
+                        nanovg::nvgGlobalScissor(nvg, 0, 0, b.getWidth(), b.getHeight());
+                        nanovg::nvgEndFrame(nvg);
+                    }, tooLarge);
+            };
+
+            Image const unselected = renderExport();
+            check(!unselected.isNull(), "the unselected export must render");
+
+            canvas->setSelected(canvas->objects[0], true);
+            canvas->setSelected(canvas->connections[0], true);
+            check(canvas->getLassoSelection().getNumSelected() == 2, "the object and cord must both be selected");
+            // SelectedItemSet broadcasts the change asynchronously, so apply it
+            // directly before the export draw to make the selection live now.
+            canvas->objects[0]->changeListenerCallback(&canvas->selectedComponents);
+            canvas->connections[0]->changeListenerCallback(&canvas->selectedComponents);
+            check(canvas->objects[0]->isSelected() && canvas->connections[0]->isSelected(),
+                "the live selection flags must be set before the export draw");
+
+            Image const selected = renderExport();
+            check(!selected.isNull(), "the selected export must render");
+
+            bool identical = !unselected.isNull() && !selected.isNull()
+                && unselected.getWidth() == selected.getWidth() && unselected.getHeight() == selected.getHeight();
+            if (identical) {
+                for (int y = 0; y < unselected.getHeight() && identical; ++y)
+                    for (int x = 0; x < unselected.getWidth(); ++x)
+                        if (unselected.getPixelAt(x, y) != selected.getPixelAt(x, y)) {
+                            identical = false;
+                            break;
+                        }
+            }
+            check(identical, "a live selection must not change a single exported pixel (no handles or hover chrome)");
+
+            auto const objectBounds = canvas->objects[0]->getBounds();
+            auto const handleRegion = exportRegionFor(Rectangle<int>(objectBounds.getX() + 4, objectBounds.getY() + 4, 2, 2), *bounds, 1);
+            auto const background = selected.getPixelAt(2, 2);
+            check(!imageRegionHasContent(selected, handleRegion, background),
+                "selection resize handles must be absent from the exported png");
+            check(imageRegionHasContent(selected, exportRegionFor(objectBounds, *bounds, 1), background),
+                "the selected export must still contain the object body pixels");
+
+            check(canvas->objects[0]->isSelected() && canvas->connections[0]->isSelected(),
+                "the live selection must still be active after the export");
+
+            canvas->deselectAll(false);
+            closeExportFixture(canvas, "export-chrome-root");
+            std::cout << "[export-chrome] selection==unselected proof passed dims="
+                      << selected.getWidth() << "x" << selected.getHeight() << std::endl;
+            consoleStep = 44;
+            startTimer(10);
+            break;
+        }
+        // (export) F1 missing coverage: a non-empty plugin-mode canvas exports
+        // its objects, and presentation mode follows the authored patch bounds
+        // while retaining an object's intentional offset from the patch origin.
+        case 44: {
+            beginTest("Export plugin mode and presentation bounds");
+            allPassed = true;
+
+            File const tempDir = File::getSpecialLocation(File::tempDirectory);
+
+            auto* pluginFixture = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n"
+                "#X obj 100 100 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n",
+                "export-plugin-root");
+            check(pluginFixture != nullptr, "the plugin-mode fixture must open");
+            if (pluginFixture) {
+                auto patch = pluginFixture->refCountedPatch;
+                registerExportGeneration(720, "export-plugin-generation", "export-plugin-root");
+
+                // Plugin mode on the main editor: the plugin Canvas renders on the
+                // active editor surface. clearCanvases() replaces the tab, so the
+                // resolver must match the plugin-mode Canvas by pointer identity.
+                editor->getTabComponent().openInPluginMode(patch);
+                editor->getTabComponent().updateNow();
+                auto* pluginCanvas = editor->getPluginModeCanvas();
+                check(pluginCanvas != nullptr, "plugin mode must own a Canvas");
+                check(editor->getCanvases().empty(), "plugin mode must replace the editor's tab canvas");
+
+                if (pluginCanvas) {
+                    pluginCanvas->performSynchronise();
+                    check(!pluginCanvas->objects.empty(), "the non-empty plugin canvas must contain its object");
+
+                    auto const pluginBounds = pluginCanvas->getExportBounds();
+                    check(pluginBounds.has_value() && !pluginBounds->isEmpty(),
+                        "the non-empty plugin canvas must have an export extent");
+
+                    File const pluginFile = tempDir.getChildFile("plugdata-export-plugin-" + String(Time::currentTimeMillis()) + ".png");
+                    pluginFile.deleteFile();
+                    consoleBegin();
+                    sendRequest(makeExportCanvasRequest(721, "export-plugin-generation", pluginFile.getFullPathName()), 721, true, {});
+                    flushDebugQueue();
+                    checkExportSaved(0, false);
+                    if (pluginBounds.has_value()) {
+                        Image const pluginImage = checkExportFile(pluginFile, *pluginBounds, "plugin-mode export");
+                        if (!pluginImage.isNull() && !pluginCanvas->objects.empty()) {
+                            auto const background = pluginImage.getPixelAt(2, 2);
+                            check(imageRegionHasContent(pluginImage,
+                                    exportRegionFor(pluginCanvas->objects[0]->getBounds(), *pluginBounds, 1), background),
+                                "the plugin-mode png must contain the fixture object landmark");
+                        }
+                    }
+                    pluginFile.deleteFile();
+                }
+
+                patch->openInPluginMode = false;
+                editor->getTabComponent().updateNow();
+                editor->pd->lockAudioThread();
+                if (auto* native = patch->getRawPointer())
+                    pd_unbind(&native->gl_obj.ob_pd, editor->pd->generateSymbol("export-plugin-root"));
+                editor->pd->unlockAudioThread();
+                for (auto* canvas : editor->getCanvases()) {
+                    if (canvas->refCountedPatch == patch) {
+                        editor->getTabComponent().closeTab(canvas);
+                        break;
+                    }
+                }
+            }
+
+            auto* presentationCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n"
+                "#X obj 50 70 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n",
+                "export-presentation-root");
+            check(presentationCanvas != nullptr, "the presentation fixture must open");
+            if (presentationCanvas) {
+                registerExportGeneration(722, "export-presentation-generation", "export-presentation-root");
+                presentationCanvas->presentationMode.setValue(true);
+
+                auto const presentationBounds = presentationCanvas->getExportBounds();
+                check(presentationBounds.has_value(), "presentation mode must yield the patch bounds");
+                if (presentationBounds.has_value()) {
+                    check(presentationBounds->getX() == presentationCanvas->canvasOrigin.x
+                            && presentationBounds->getY() == presentationCanvas->canvasOrigin.y,
+                        "presentation bounds must start at the patch origin");
+                    check(presentationBounds->getWidth() == 300 && presentationBounds->getHeight() == 200,
+                        "presentation bounds must equal the authored 300x200 patch dimensions");
+                }
+
+                File const presentationFile = tempDir.getChildFile("plugdata-export-presentation-" + String(Time::currentTimeMillis()) + ".png");
+                presentationFile.deleteFile();
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(723, "export-presentation-generation", presentationFile.getFullPathName()), 723, true, {});
+                flushDebugQueue();
+                checkExportSaved(0, false);
+                if (presentationBounds.has_value()) {
+                    Image const presentationImage = checkExportFile(presentationFile, *presentationBounds, "presentation export");
+                    if (!presentationImage.isNull() && !presentationCanvas->objects.empty()) {
+                        auto const background = presentationImage.getPixelAt(2, 2);
+                        check(imageRegionHasContent(presentationImage,
+                                exportRegionFor(presentationCanvas->objects[0]->getBounds(), *presentationBounds, 1), background),
+                            "the presentation png must retain the object's offset from the patch origin");
+                        Rectangle<int> const emptyRegion(250, 170, 20, 20);
+                        check(!imageRegionHasContent(presentationImage, emptyRegion, background),
+                            "the presentation png must not fabricate content away from the authored object");
+                    }
+                }
+                presentationFile.deleteFile();
+
+                presentationCanvas->presentationMode.setValue(false);
+                closeExportFixture(presentationCanvas, "export-presentation-root");
+            }
+
+            std::cout << "[export-plugin-presentation] plugin and presentation exports passed" << std::endl;
+            consoleStep = 45;
+            startTimer(10);
+            break;
+        }
+        // (export) F1 missing coverage: a bounded drawable contributes to the
+        // extent, an unbounded drawable fails typed, editor zoom does not change
+        // a single exported pixel, and negative coordinates export correctly.
+        case 45: {
+            beginTest("Export drawables zoom and negative coordinates");
+            allPassed = true;
+
+            File const tempDir = File::getSpecialLocation(File::tempDirectory);
+            auto* surface = &editor->nvgSurface;
+
+            auto* drawableCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n"
+                "#X obj 100 100 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n",
+                "export-drawable-root");
+            check(drawableCanvas != nullptr, "the drawable fixture must open");
+            if (drawableCanvas) {
+                auto const objectBounds = drawableCanvas->objects.empty() ? Rectangle<int>() : drawableCanvas->objects[0]->getBounds();
+                ExportTestDrawable bounded;
+                bounded.setBounds(objectBounds.getRight() + 40, objectBounds.getY(), 60, 40);
+                bounded.setVisible(true);
+                drawableCanvas->drawables.add(juce::WeakReference<NVGComponent>(&bounded));
+
+                auto const drawableBounds = drawableCanvas->getExportBounds();
+                check(drawableBounds.has_value(), "a bounded drawable must still yield an extent");
+                check(drawableBounds.has_value() && drawableBounds->contains(bounded.getBounds()),
+                    "the export extent must contain the bounded drawable");
+                if (drawableBounds.has_value()) {
+                    bool tooLarge = false;
+                    Image const image = surface->renderOffscreenImage(drawableBounds->getWidth(), drawableBounds->getHeight(),
+                        [drawableCanvas, b = *drawableBounds](NVGcontext* nvg) {
+                            nanovg::nvgBeginFrame(nvg, static_cast<float>(b.getWidth()), static_cast<float>(b.getHeight()), 1.0f);
+                            drawableCanvas->renderForExport(nvg, b);
+                            nanovg::nvgGlobalScissor(nvg, 0, 0, b.getWidth(), b.getHeight());
+                            nanovg::nvgEndFrame(nvg);
+                        }, tooLarge);
+                    check(!image.isNull(), "the bounded-drawable export must render");
+                    if (!image.isNull()) {
+                        auto const background = image.getPixelAt(2, 2);
+                        check(imageRegionHasContent(image, exportRegionFor(bounded.getBounds(), *drawableBounds, 1), background),
+                            "the bounded drawable must paint inside the exported extent");
+                    }
+                }
+                drawableCanvas->drawables.clear();
+                closeExportFixture(drawableCanvas, "export-drawable-root");
+            }
+
+            auto* unboundedCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n"
+                "#X obj 100 100 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n",
+                "export-unbounded-root");
+            check(unboundedCanvas != nullptr, "the unbounded-drawable fixture must open");
+            if (unboundedCanvas) {
+                registerExportGeneration(730, "export-unbounded-generation", "export-unbounded-root");
+                NVGComponent unbounded(unboundedCanvas);
+                unboundedCanvas->drawables.add(juce::WeakReference<NVGComponent>(&unbounded));
+
+                String reason;
+                check(!unboundedCanvas->getExportBounds(&reason).has_value(),
+                    "a drawable without a determinable extent must yield no export extent");
+                check(reason.containsIgnoreCase("drawable"),
+                    "the unbounded-drawable failure must name the drawable (actual: " + reason + ")");
+
+                File const unboundedFile = tempDir.getChildFile("plugdata-export-unbounded-" + String(Time::currentTimeMillis()) + ".png");
+                unboundedFile.deleteFile();
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(731, "export-unbounded-generation", unboundedFile.getFullPathName()), 731, false, "ExportFailed");
+                flushDebugQueue();
+                checkConsoleReply(0, 731, false, "ExportFailed");
+                checkConsoleErrorMessage(0, "canvas contains a drawable with no determinable extent");
+                check(!unboundedFile.existsAsFile(), "an unbounded-drawable export must not create a file");
+
+                unboundedCanvas->drawables.clear();
+                closeExportFixture(unboundedCanvas, "export-unbounded-root");
+            }
+
+            auto* zoomCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n"
+                "#X obj 100 100 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n"
+                "#X obj 600 100 bng 15 250 50 0 empty empty empty 17 7 0 10 #fcfcfc #000000 #000000;\n"
+                "#X connect 0 0 1 0;\n",
+                "export-zoom-root");
+            check(zoomCanvas != nullptr, "the zoom fixture must open");
+            if (zoomCanvas) {
+                auto const zoomBounds = zoomCanvas->getExportBounds();
+                check(zoomBounds.has_value() && !zoomBounds->isEmpty(), "the zoom fixture must have an extent");
+                if (zoomBounds.has_value()) {
+                    auto renderAtZoom = [surface, zoomCanvas, b = *zoomBounds](float zoom) {
+                        zoomCanvas->zoomScale.setValue(zoom);
+                        bool tooLarge = false;
+                        return surface->renderOffscreenImage(b.getWidth(), b.getHeight(),
+                            [zoomCanvas, b](NVGcontext* nvg) {
+                                nanovg::nvgBeginFrame(nvg, static_cast<float>(b.getWidth()), static_cast<float>(b.getHeight()), 1.0f);
+                                zoomCanvas->renderForExport(nvg, b);
+                                nanovg::nvgGlobalScissor(nvg, 0, 0, b.getWidth(), b.getHeight());
+                                nanovg::nvgEndFrame(nvg);
+                            }, tooLarge);
+                    };
+
+                    Image const half = renderAtZoom(0.5f);
+                    Image const twice = renderAtZoom(2.0f);
+                    check(!half.isNull() && !twice.isNull(), "both editor-zoom exports must render");
+                    check(half.getWidth() == zoomBounds->getWidth() && half.getHeight() == zoomBounds->getHeight(),
+                        "the exported dimensions must stay the logical extent at 50% editor zoom");
+
+                    bool sameAtZooms = !half.isNull() && !twice.isNull()
+                        && half.getWidth() == twice.getWidth() && half.getHeight() == twice.getHeight();
+                    if (sameAtZooms) {
+                        for (int y = 0; y < half.getHeight() && sameAtZooms; ++y)
+                            for (int x = 0; x < half.getWidth(); ++x)
+                                if (half.getPixelAt(x, y) != twice.getPixelAt(x, y)) {
+                                    sameAtZooms = false;
+                                    break;
+                                }
+                    }
+                    check(sameAtZooms, "editor zoom (50% vs 200%) must not change a single exported pixel");
+
+                    if (!half.isNull()) {
+                        auto const background = half.getPixelAt(2, 2);
+                        for (auto const* object : zoomCanvas->objects)
+                            if (object->getObjectBounds().getX() < 300)
+                                check(imageRegionHasContent(half, exportRegionFor(object->getBounds(), *zoomBounds, 1), background),
+                                    "the 50%-zoom export must still contain the near object landmark");
+                    }
+                }
+                zoomCanvas->zoomScale.setValue(1.0f);
+                closeExportFixture(zoomCanvas, "export-zoom-root");
+            }
+
+            auto* negativeCanvas = openBoundExportFixture(
+                "#N canvas 100 100 300 200 12;\n#X obj -80 -50 print neg-target;\n",
+                "export-negative-root");
+            check(negativeCanvas != nullptr, "the negative-coordinate fixture must open");
+            if (negativeCanvas) {
+                registerExportGeneration(740, "export-negative-generation", "export-negative-root");
+                auto const negativeBounds = negativeCanvas->getExportBounds();
+                check(negativeBounds.has_value() && !negativeBounds->isEmpty(),
+                    "the negative-coordinate fixture must have an extent");
+
+                File const negativeFile = tempDir.getChildFile("plugdata-export-negative-" + String(Time::currentTimeMillis()) + ".png");
+                negativeFile.deleteFile();
+                consoleBegin();
+                sendRequest(makeExportCanvasRequest(741, "export-negative-generation", negativeFile.getFullPathName()), 741, true, {});
+                flushDebugQueue();
+                checkExportSaved(0, false);
+                if (negativeBounds.has_value()) {
+                    Image const negativeImage = checkExportFile(negativeFile, *negativeBounds, "negative-coordinate export");
+                    if (!negativeImage.isNull() && !negativeCanvas->objects.empty()) {
+                        auto const background = negativeImage.getPixelAt(2, 2);
+                        check(imageRegionHasContent(negativeImage,
+                                exportRegionFor(negativeCanvas->objects[0]->getBounds(), *negativeBounds, 1), background),
+                            "a negative-coordinate object must render inside its mapped export region");
+                    }
+                }
+                negativeFile.deleteFile();
+                closeExportFixture(negativeCanvas, "export-negative-root");
+            }
+
+            std::cout << "[export-drawable-zoom-negative] all export coverage cases passed" << std::endl;
             finishConsole();
             break;
         }
