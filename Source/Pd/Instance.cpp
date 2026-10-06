@@ -56,6 +56,8 @@ void (*canvasEditFailureHookForTesting)(void*) = nullptr;
 void* canvasEditFailureContextForTesting = nullptr;
 void (*canvasEditGuiMismatchHookForTesting)(void*) = nullptr;
 void* canvasEditGuiMismatchContextForTesting = nullptr;
+void (*exportWriteFailureHookForTesting)(void*) = nullptr;
+void* exportWriteFailureContextForTesting = nullptr;
 #endif
 var makeDebugError(int const requestId, String const& code, String const& message)
 {
@@ -233,38 +235,6 @@ bool hasOnlyClearConsoleFields(DynamicObject const& request)
     return true;
 }
 
-bool hasOnlyExportCanvasFields(DynamicObject const& request)
-{
-    auto const& properties = request.getProperties();
-    if (properties.size() != 5)
-        return false;
-
-    bool sawVersion = false;
-    bool sawRequestId = false;
-    bool sawOperation = false;
-    bool sawGeneration = false;
-    bool sawPath = false;
-
-    for (auto const& [name, value] : properties) {
-        ignoreUnused(value);
-        auto const propertyName = name.toString();
-        if (propertyName == "version")
-            sawVersion = true;
-        else if (propertyName == "request_id")
-            sawRequestId = true;
-        else if (propertyName == "operation")
-            sawOperation = true;
-        else if (propertyName == "generation")
-            sawGeneration = true;
-        else if (propertyName == "path")
-            sawPath = true;
-        else
-            return false;
-    }
-
-    return sawVersion && sawRequestId && sawOperation && sawGeneration && sawPath;
-}
-
 bool hasFields(DynamicObject const& object, std::initializer_list<char const*> required, std::initializer_list<char const*> optional = {})
 {
     auto const& properties = object.getProperties();
@@ -284,6 +254,11 @@ bool hasFields(DynamicObject const& object, std::initializer_list<char const*> r
             return false;
     }
     return true;
+}
+
+bool hasOnlyExportCanvasFields(DynamicObject const& request)
+{
+    return hasFields(request, { "version", "request_id", "operation", "generation", "path" }, { "canvas_path", "scale" });
 }
 
 bool boundedString(var const& value, int const maxBytes)
@@ -2136,6 +2111,11 @@ void setCanvasEditGuiMismatchHookForTesting(void (*hook)(void*), void* context)
     canvasEditGuiMismatchHookForTesting = hook;
     canvasEditGuiMismatchContextForTesting = context;
 }
+void setExportWriteFailureHookForTesting(void (*hook)(void*), void* context)
+{
+    exportWriteFailureHookForTesting = hook;
+    exportWriteFailureContextForTesting = context;
+}
 #endif
 
 Instance::Instance()
@@ -3932,6 +3912,18 @@ void Instance::handleDebugMessage(Message const& message)
             return;
         }
 
+        auto const scaleValue = request->getProperty("scale");
+        if ((request->hasProperty("scale") && !(scaleValue.isInt() || scaleValue.isInt64()))
+            || (request->hasProperty("scale") && (static_cast<int64>(scaleValue) < 1 || static_cast<int64>(scaleValue) > 4))) {
+            reply(makeDebugError(requestId, "InvalidRequest", "scale must be an integer from 1 through 4"), requestId);
+            return;
+        }
+        auto const requestedPath = request->getProperty("canvas_path");
+        if (request->hasProperty("canvas_path") && !canvasPathValid(requestedPath, {}, false)) {
+            reply(makeDebugError(requestId, "InvalidRequest", "canvas_path must contain at most 32 non-negative integer ordinals"), requestId);
+            return;
+        }
+
         // Resolve the registered root under a single Pd lock acquisition,
         // capturing only the pointer value: the captured pointer is never
         // dereferenced after the lock is released, and WeakReference::get()
@@ -3947,8 +3939,26 @@ void Instance::handleDebugMessage(Message const& message)
             auto* canvas = debugRoot->getRawUnchecked<t_canvas>();
             if (pd_class(&canvas->gl_obj.ob_pd) != canvas_class)
                 runtimeError = "CanvasNotFound";
-            else
-                capturedCanvas = canvas;
+            else {
+                if (auto const* ordinals = requestedPath.getArray()) {
+                    for (auto const& component : *ordinals) {
+                        auto* object = canvas->gl_list;
+                        for (int ordinal = static_cast<int>(component); object && ordinal > 0; --ordinal)
+                            object = object->g_next;
+                        if (!object) {
+                            runtimeError = "CanvasNotFound";
+                            break;
+                        }
+                        if (pd_class(&object->g_pd) != canvas_class) {
+                            runtimeError = "CanvasTypeMismatch";
+                            break;
+                        }
+                        canvas = reinterpret_cast<t_canvas*>(object);
+                    }
+                }
+                if (runtimeError.isEmpty())
+                    capturedCanvas = canvas;
+            }
         }
         unlockAudioThread();
 
@@ -3961,76 +3971,131 @@ void Instance::handleDebugMessage(Message const& message)
         // Match the captured pointer value against live canvases on the message
         // thread; the captured value is only ever compared, never dereferenced.
         Canvas* targetCanvas = nullptr;
+        auto matchCanvas = [&](auto&& self, Component* component) -> void {
+            if (auto* canvas = dynamic_cast<Canvas*>(component)) {
+                auto canvasPtr = canvas->patch.getPointer();
+                if (canvasPtr && canvasPtr.get() == capturedCanvas)
+                    targetCanvas = canvas;
+            }
+            for (auto* child : component->getChildren()) {
+                if (!targetCanvas)
+                    self(self, child);
+            }
+        };
         for (auto* editor : static_cast<PluginProcessor*>(this)->getEditors()) {
             for (auto* canvas : editor->getCanvases()) {
-                auto canvasPtr = canvas->patch.getPointer();
-                if (canvasPtr && canvasPtr.get() == capturedCanvas) {
-                    targetCanvas = canvas;
-                    break;
-                }
+                matchCanvas(matchCanvas, canvas);
+                if (targetCanvas) break;
             }
+            if (!targetCanvas && editor->getPluginModeCanvas())
+                matchCanvas(matchCanvas, editor->getPluginModeCanvas());
             if (targetCanvas)
                 break;
         }
 
-        if (!targetCanvas || !targetCanvas->isShowing()) {
-            reply(makeDebugError(requestId, "CanvasNotFound", "canvas is not currently displayed"), requestId);
+        // An existing Canvas must exist for the captured pointer; a never
+        // instantiated child or a destroyed root has none. Display state is
+        // irrelevant now: inactive tabs, plugin-mode and graph-on-parent
+        // canvases all export offscreen.
+        if (!targetCanvas) {
+            reply(makeDebugError(requestId, "CanvasNotFound", "canvas is not instantiated"), requestId);
             return;
         }
 
-        Rectangle<int> contentRegion;
-        if (getValue<bool>(targetCanvas->presentationMode)) {
-            contentRegion = Rectangle<int>(targetCanvas->canvasOrigin.x, targetCanvas->canvasOrigin.y,
-                getValue<int>(targetCanvas->patchWidth), getValue<int>(targetCanvas->patchHeight));
-        } else {
-            bool hasContent = false;
-            for (auto const* object : targetCanvas->objects) {
-                auto const bounds = object->getBounds();
-                contentRegion = hasContent ? contentRegion.getUnion(bounds) : bounds;
-                hasContent = true;
-            }
-            if (hasContent)
-                contentRegion = contentRegion.expanded(24);
-        }
-
-        if (contentRegion.isEmpty()) {
-            reply(makeDebugError(requestId, "ExportFailed", "canvas has no visible content"), requestId);
+        // Full-content extent in logical canvas units: independent of viewport
+        // scroll, editor zoom and desktop DPI.
+        String extentReason;
+        auto const exportBounds = targetCanvas->getExportBounds(&extentReason);
+        if (!exportBounds.has_value() || exportBounds->isEmpty()) {
+            reply(makeDebugError(requestId, "ExportFailed", extentReason.isNotEmpty() ? extentReason : "canvas has no visible content"), requestId);
             return;
         }
 
-        auto const topLeft = targetCanvas->editor->getLocalPoint(targetCanvas, contentRegion.getTopLeft());
-        auto const bottomRight = targetCanvas->editor->getLocalPoint(targetCanvas, contentRegion.getBottomRight());
-        auto const editorRegion = Rectangle<int>::leftTopRightBottom(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y);
-        auto const visibleRegion = editorRegion.getIntersection(targetCanvas->editor->getLocalBounds());
-        if (visibleRegion.isEmpty()) {
-            reply(makeDebugError(requestId, "ExportFailed", "canvas has no visible content"), requestId);
+        int const scale = request->hasProperty("scale") ? static_cast<int>(request->getProperty("scale")) : 1;
+
+        // Output size is the logical extent times the request scale. The bounds
+        // are integer logical units, so this multiplication is exact.
+        int64 const outputWidth = static_cast<int64>(exportBounds->getWidth()) * scale;
+        int64 const outputHeight = static_cast<int64>(exportBounds->getHeight()) * scale;
+
+        // Size caps are checked before any allocation, using int64 arithmetic so
+        // the pixel/byte products cannot overflow.
+        constexpr int64 maxAxis = 8192;
+        constexpr int64 maxPixels = 16777216;
+        auto* surface = &targetCanvas->editor->nvgSurface;
+        int64 const backendMax = surface->getMaxTextureSize();
+
+        if (outputWidth > maxAxis || outputHeight > maxAxis) {
+            reply(makeDebugError(requestId, "ExportTooLarge", "export exceeds the 8192 pixel per-axis limit"), requestId);
+            return;
+        }
+        int64 const totalPixels = outputWidth * outputHeight;
+        if (totalPixels > maxPixels) {
+            reply(makeDebugError(requestId, "ExportTooLarge", "export exceeds the 16777216 total pixel limit"), requestId);
+            return;
+        }
+        if (backendMax > 0 && (outputWidth > backendMax || outputHeight > backendMax)) {
+            reply(makeDebugError(requestId, "ExportTooLarge", "export exceeds the backend texture limit of " + String(backendMax) + " pixels"), requestId);
             return;
         }
 
-        bool const clipped = visibleRegion != editorRegion;
+        int const width = static_cast<int>(outputWidth);
+        int const height = static_cast<int>(outputHeight);
+        auto const bounds = *exportBounds;
 
-        auto const image = targetCanvas->editor->nvgSurface.renderToImage(visibleRegion);
+        bool tooLarge = false;
+        auto const image = surface->renderOffscreenImage(width, height,
+            [targetCanvas, bounds, width, height, scale](NVGcontext* nvg) {
+                nanovg::nvgBeginFrame(nvg, static_cast<float>(width), static_cast<float>(height), 1.0f);
+                if (scale > 1)
+                    nanovg::nvgScale(nvg, static_cast<float>(scale), static_cast<float>(scale));
+                targetCanvas->renderForExport(nvg, bounds);
+                nanovg::nvgGlobalScissor(nvg, 0, 0, width, height);
+                nanovg::nvgEndFrame(nvg);
+            }, tooLarge);
+        if (tooLarge) {
+            reply(makeDebugError(requestId, "ExportTooLarge", "export exceeds the backend texture limit"), requestId);
+            return;
+        }
         if (image.isNull()) {
             reply(makeDebugError(requestId, "ExportFailed", "framebuffer readback failed"), requestId);
             return;
         }
 
-        // FileOutputStream appends to an existing file instead of truncating it
-        // (POSIX open O_RDWR + seek to end), so remove any previous export
-        // first to guarantee overwrite semantics.
+        // Publish atomically: encode to a staging file in the destination
+        // directory, flush and close it, then rename over the destination only
+        // after a completely written image. FileOutputStream appends to an
+        // existing file, and deleting the previous export up front would lose
+        // good output if encoding then failed, so TemporaryFile stages the new
+        // bytes next to the target and replaces it on success. On any failure
+        // the staging file is removed and the previous destination bytes are
+        // left untouched.
         File const file(path);
-        if (file.existsAsFile() && !file.deleteFile()) {
+        TemporaryFile temp(file);
+        {
+            FileOutputStream fos(temp.getFile());
+            bool failed = !fos.openedOk() || !PNGImageFormat().writeImageToStream(image, fos);
+#if ENABLE_TESTING
+            if (exportWriteFailureHookForTesting) {
+                auto const hook = exportWriteFailureHookForTesting;
+                auto* const context = exportWriteFailureContextForTesting;
+                exportWriteFailureHookForTesting = nullptr;
+                exportWriteFailureContextForTesting = nullptr;
+                hook(context);
+                failed = true;
+            }
+#endif
+            if (failed) {
+                reply(makeDebugError(requestId, "ExportFailed", "failed to write png file"), requestId);
+                return;
+            }
+        }
+        if (!temp.overwriteTargetFileWithTemporary()) {
             reply(makeDebugError(requestId, "ExportFailed", "failed to write png file"), requestId);
             return;
         }
 
-        FileOutputStream fos(file);
-        if (!fos.openedOk() || !PNGImageFormat().writeImageToStream(image, fos)) {
-            reply(makeDebugError(requestId, "ExportFailed", "failed to write png file"), requestId);
-            return;
-        }
-
-        reply(makeExportSuccess(requestId, clipped), requestId);
+        reply(makeExportSuccess(requestId, false), requestId);
         return;
     }
 
