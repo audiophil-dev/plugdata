@@ -157,24 +157,41 @@ with `request_id: 0`.
   historical console state. This hard clear is a separate, non-reversible
   operation from the sidebar's own "clear" button, which still just moves
   visible entries into history for later restore.
-- `export_canvas` renders the registered root canvas at its current zoom
-  and scroll position and writes the visible content region to `path`, an
-  absolute file path ending in `.png` (anything else replies
-  `InvalidRequest`). It presents the same `generation` token as
-  `send_object`: the generation must still be registered, and the canvas
-  must be currently displayed, otherwise the reply is `StaleGeneration` or
-  `CanvasNotFound`. v1 is root-only - there is no `canvas_path`, and no
-  `scale` or `fit` parameter. The capture is the canvas content region (the
-  union of all object bounds plus a margin) mapped through the current view
-  and clipped to the visible editor area, so offscreen content is excluded;
-  the reply carries only `status: "saved"`
-  and `clipped: true` when the content extent reaches past the captured
-  region (`false` otherwise), and never carries image bytes. An existing
-  file at `path` is overwritten. A canvas with no objects, content that
-  lies entirely outside the viewport, or a target file that cannot be
-  opened or written replies `ExportFailed`. The plugin process writes the
-  requested path, so this operation is intended for the local managed-tool
-  trust boundary.
+- `export_canvas` renders the whole authored content of the registered root
+  canvas, or of an already-open child canvas addressed by an optional
+  `canvas_path`, and writes it to `path`, an absolute file path ending in
+  `.png` (anything else replies `InvalidRequest`). It presents the same
+  `generation` token as `send_object`: the generation must still be
+  registered, otherwise the reply is `StaleGeneration`. The target canvas is
+  resolved under the Pd lock from the registered root plus the optional
+  `canvas_path` (an ordinal-only array, at most 32 nonnegative integers,
+  default empty for the root); a path component that is not a canvas replies
+  `CanvasTypeMismatch`. The resolved canvas must have an existing editor
+  Canvas - an inactive tab, a plugin-mode canvas, a graph-on-parent child and
+  a hidden-but-open tab all qualify, and display state is irrelevant. A child
+  that has never been instantiated has no Canvas and replies `CanvasNotFound`.
+  The capture is the full authored extent in logical canvas coordinates: the
+  union of all visible object bodies, their labels, connection paths
+  (including bends) and bounded drawables, plus a 24-pixel margin, with
+  window chrome, scrollbars, selection, lasso and search overlays excluded.
+  Offscreen content is included; the image does not depend on the editor's
+  scroll position, zoom level or desktop DPI. An optional integer `scale`
+  (1 through 4, default 1) multiplies the output dimensions; output is 1
+  pixel per logical canvas unit per scale step, by exact integer
+  multiplication. The reply carries only `status: "saved"` and `clipped: false`,
+  and never carries image bytes. Size caps are checked before any
+  allocation: an axis over 8192 pixels, more than 16,777,216 total pixels,
+  or a smaller backend 2D texture limit replies `ExportTooLarge`. Publication is atomic: the PNG is staged in the
+  destination directory and replaces the target only after a completely
+  written image, so a failed export preserves the previous file byte-for-byte
+  and leaves no temporary artifact. A canvas with no visible content, a
+  drawable whose extent cannot be determined, or a target file that cannot be
+  written replies `ExportFailed`. A subpatch
+  that has never been opened cannot be exported. The backend texture limit is
+  the device's reported maximum 2D texture dimension (for example a Metal
+  device's `maxTextureDimension2D`). The plugin process writes
+  the requested path, so this operation is intended for the local
+  managed-tool trust boundary.
 
 ### Canvas read/edit wire contract (v1)
 
