@@ -13,3 +13,5 @@ No active implementation task in this fork.
 ## Next
 
 - Integrate the fork receiver into pd-mcp public live-edit tools in a separate approved task; the existing pd-mcp guard stays in place until then.
+
+[2026-10-06 15:10:00] - Completed full-canvas offscreen export: 7 implementation tasks + 4 final gates APPROVE (96h 35m). Dedicated offscreen NVG render target with async-layer primitives, authored visual extent + chrome-free draw, scale/nested targeting, atomic PNG publication, managed probe 164/164 checks. Upstreamed the nanovg delta as audiophil-dev/nanovg async-offscreen-passes and opened the upstream PR.
