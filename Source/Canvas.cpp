@@ -781,6 +781,8 @@ void Canvas::renderAllConnections(NVGcontext* nvg, Rectangle<int> const area)
     if (!connectionLayer.isVisible())
         return;
 
+    bool const exportDraw = isDrawingForExport();
+
     SmallArray<Connection*> connectionsToDraw;
     SmallArray<Connection*> connectionsToDrawSelected;
     Connection* hovered = nullptr;
@@ -788,13 +790,13 @@ void Canvas::renderAllConnections(NVGcontext* nvg, Rectangle<int> const area)
     for (auto* connection : connections) {
         NVGScopedState scopedState(nvg);
         if (connection->intersectsRectangle(area) && connection->isVisible()) {
-            if (connection->isMouseHovering())
+            if (!exportDraw && connection->isMouseHovering())
                 hovered = connection;
-            else if (!connection->isSelected())
+            else if (exportDraw || !connection->isSelected())
                 connection->render(nvg);
             else
                 connectionsToDrawSelected.add(connection);
-            if (showConnectionOrder) {
+            if (showConnectionOrder && !exportDraw) {
                 connectionsToDraw.add(connection);
             }
         }
@@ -818,6 +820,118 @@ void Canvas::renderAllConnections(NVGcontext* nvg, Rectangle<int> const area)
             connection->renderConnectionOrder(nvg);
         }
     }
+}
+
+std::optional<Rectangle<int>> Canvas::getExportBounds(String* reason) const
+{
+    auto fail = [reason](String const& why) -> std::optional<Rectangle<int>> {
+        if (reason)
+            *reason = why;
+        return std::nullopt;
+    };
+
+    // Presentation mode has an authored, intentional extent: the patch bounds.
+    if (::getValue<bool>(presentationMode)) {
+        auto const width = getValue<int>(patchWidth);
+        auto const height = getValue<int>(patchHeight);
+        if (width <= 0 || height <= 0)
+            return fail("canvas has no visible content");
+        return Rectangle<int>(canvasOrigin.x, canvasOrigin.y, width, height);
+    }
+
+    Rectangle<int> bounds;
+    bool hasContent = false;
+    auto addBounds = [&bounds, &hasContent](Rectangle<int> const& b) {
+        if (b.isEmpty())
+            return;
+        bounds = hasContent ? bounds.getUnion(b) : b;
+        hasContent = true;
+    };
+
+    for (auto const* object : objects) {
+        if (!object->isVisible())
+            continue;
+
+        addBounds(object->getBounds());
+
+        // Labels are Canvas children positioned in canvas coordinates, so their
+        // bounds union directly. They may extend beyond the object body.
+        if (object->gui) {
+            for (auto const* label : object->gui->labels) {
+                if (label && label->isVisible())
+                    addBounds(label->getBounds());
+            }
+        }
+    }
+
+    for (auto const* connection : connections) {
+        if (connection->isVisible())
+            addBounds(connection->getBounds());
+    }
+
+    for (auto const& drawable : drawables) {
+        if (!drawable)
+            continue;
+        if (auto const* component = dynamic_cast<Component const*>(drawable.get())) {
+            if (component->isVisible())
+                addBounds(component->getBounds());
+        } else {
+            // A drawable whose extent cannot be determined must fail explicitly
+            // rather than be silently omitted from the export.
+            return fail("canvas contains a drawable with no determinable extent");
+        }
+    }
+
+    if (!hasContent)
+        return fail("canvas has no visible content");
+
+    return bounds.expanded(24);
+}
+
+void Canvas::renderForExport(NVGcontext* nvg, Rectangle<int> logicalBounds)
+{
+    if (logicalBounds.isEmpty())
+        return;
+
+    exportDrawMode = true;
+
+    auto const& colours = getThemeColours(*this);
+    bool const presentation = ::getValue<bool>(presentationMode);
+
+    nanovg::nvgSave(nvg);
+
+    // Map the logical canvas origin to the output origin. No viewport scroll,
+    // zoom or device-scale term is applied: 1 output pixel per logical unit.
+    nanovg::nvgTranslate(nvg, -logicalBounds.getX(), -logicalBounds.getY());
+
+    // The offscreen target is cleared to transparent black, so paint the theme
+    // background ourselves.
+    nanovg::nvgFillColor(nvg, nvgColour(presentation ? colours.presentationBackgroundColour : colours.canvasBackgroundColour));
+    nanovg::nvgFillRect(nvg, logicalBounds.getX(), logicalBounds.getY(), logicalBounds.getWidth(), logicalBounds.getHeight());
+
+    // Bounded drawables render behind objects, exactly like performRender.
+    for (auto drawable : drawables) {
+        if (!drawable)
+            continue;
+        if (auto const* component = dynamic_cast<Component*>(drawable.get())) {
+            if (component->isVisible() && logicalBounds.intersects(component->getBounds()))
+                drawable->render(nvg);
+        }
+    }
+
+    if (presentation || isGraph) {
+        renderAllObjects(nvg, logicalBounds);
+    } else if (connectionsBehind) {
+        renderAllConnections(nvg, logicalBounds);
+        renderAllObjects(nvg, logicalBounds);
+    } else {
+        renderAllObjects(nvg, logicalBounds);
+        renderAllConnections(nvg, logicalBounds);
+    }
+
+    nanovg::nvgRestore(nvg);
+
+    exportDrawMode = false;
 }
 
 void Canvas::settingsChanged(String const& name, var const& value)

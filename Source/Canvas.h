@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <optional>
 #include <nanovg_async.h>
 #ifdef NANOVG_GL_IMPLEMENTATION
 #    include <juce_opengl/juce_opengl.h>
@@ -98,6 +99,28 @@ public:
 
     void renderAllObjects(NVGcontext* nvg, Rectangle<int> area);
     void renderAllConnections(NVGcontext* nvg, Rectangle<int> area);
+
+    // Logical-canvas-unit extent of all authored visual content: object bodies,
+    // their labels, connection cords (including bends and corners) and bounded
+    // drawables, expanded by the 24-unit export margin. Presentation mode uses
+    // the authored patch bounds instead. Zoom, viewport scroll and device scale
+    // never affect the result. Returns std::nullopt when no extent can be
+    // determined (empty canvas or an unbounded drawable); when `reason` is
+    // non-null it receives a caller-facing explanation so the failure is typed
+    // and honest rather than a silent crop.
+    std::optional<Rectangle<int>> getExportBounds(String* reason = nullptr) const;
+
+    // True while renderForExport is drawing. The live render path must ignore
+    // this; the export path uses it to omit selection/hover/editor chrome, and
+    // Object/Connection consult it so a live selection cannot leak into a PNG.
+    bool isDrawingForExport() const { return exportDrawMode; }
+
+    // Draws authored content only - no selection/lasso, drag handles, suggestor,
+    // search highlight, grid, scrollbars or window chrome - into `nvg`, with
+    // `logicalBounds`' origin mapped to the output origin at 1 pixel per logical
+    // canvas unit. Must be called while recording a standalone frame (the caller
+    // owns nvgBeginFrame/nvgEndFrame and the theme-clear viewport).
+    void renderForExport(NVGcontext* nvg, Rectangle<int> logicalBounds);
 
     int getOverlays() const;
     void updateOverlays();
@@ -226,6 +249,7 @@ public:
     bool showConnectionDirection : 1 = false;
     bool showConnectionActivity : 1 = false;
 
+    bool exportDrawMode : 1 = false;
     bool isZooming : 1 = false;
     bool isGraph : 1 = false;
     bool isDraggingLasso : 1 = false;

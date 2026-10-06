@@ -197,8 +197,22 @@ public:
     // Safe to call from the message thread; blocks briefly on the render thread.
     Image renderToImage(Rectangle<int> logicalArea);
 
+    // Renders `draw` into a dedicated offscreen target of `width` x `height`
+    // device pixels and reads the result back as an opaque top-left-origin image.
+    // `draw` is recorded on THIS (message) thread into a standalone pass - exactly
+    // like a normal frame, bracketing its own nvgBeginFrame/nvgEndFrame - and the
+    // render thread replays that pass into the dedicated target. The live editor
+    // framebuffer and viewport are never bound or resized. Returns an empty image
+    // on failure; `tooLarge` is set when the requested size exceeds the backend
+    // texture limit or the pixel budget.
+    Image renderOffscreenImage(int width, int height, std::function<void(NVGcontext*)> draw, bool& tooLarge);
+
+    // Backend maximum 2D texture dimension, or 0 when unavailable.
+    int getMaxTextureSize() const;
+
 private:
     void serviceReadbackRequest();
+    void serviceOffscreenRequest();
 
     float calculateRenderScale() const;
     void updateRenderScale();
@@ -272,6 +286,26 @@ private:
     int readbackWidth = 0;
     int readbackHeight = 0;
     bool readbackSucceeded = false;
+
+    // Offscreen export target. `renderOffscreenImage` records the target's
+    // creation and the caller's draw as a standalone pass on the message thread;
+    // the render thread drains that pass, reads the target back, then deletes it,
+    // so the live editor target is never touched.
+    CriticalSection offscreenLock;
+    WaitableEvent offscreenReady;
+    AtomicValue<bool> offscreenPending { false };
+    int offscreenWidth = 0;
+    int offscreenHeight = 0;
+    void* offscreenTarget = nullptr;
+    uint64_t offscreenRequestId = 0;
+    HeapBlock<uint8> offscreenData;
+    bool offscreenSucceeded = false;
+
+    // Backend 2D texture limit captured on the render thread (where the real
+    // context is current). The message thread only reads this cache:
+    // nvgMaxTextureSize is synchronous against the real context, so querying it
+    // from the message thread on GL would return 0 with no current context.
+    AtomicValue<int> cachedMaxTextureSize { 0 };
 
 #if PLUGDATA_NVG_FRAME_TIME_OVERLAY
     std::unique_ptr<FrameTimeOverlay> frameTimeOverlay;

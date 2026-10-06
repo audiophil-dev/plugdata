@@ -137,7 +137,10 @@ void Object::setSelected(bool const shouldBeSelected)
 
 bool Object::isSelected() const
 {
-    return selectedFlag;
+    // Report "not selected" for the duration of the export draw so no GUI object
+    // paints its selection outline. The live `selectedFlag` is untouched and the
+    // real state returns as soon as renderForExport restores its flag.
+    return selectedFlag && !(cnv && cnv->isDrawingForExport());
 }
 
 void Object::settingsChanged(String const& name, var const& value)
@@ -1182,6 +1185,14 @@ void Object::mouseDrag(MouseEvent const& e)
 
 void Object::render(NVGcontext* nvg)
 {
+    if (cnv->isDrawingForExport()) {
+        // Single-shot export draw: render fresh so the suppression flag applies
+        // and the live command-buffer cache (which may hold selection chrome) is
+        // neither replayed nor overwritten.
+        performRender(nvg);
+        return;
+    }
+
     if(commandBufferDirty) {
         commandBuffer.clear();
         nanovg::ScopedCommandRecorder recorder(nvg, commandBuffer);
@@ -1205,7 +1216,7 @@ void Object::performRender(NVGcontext* nvg)
         nanovg::nvgSmoothGlow(nvg, lb.getX(), lb.getY(), lb.getWidth(), lb.getHeight(), glowColour, nanovg::nvgRGBA(0, 0, 0, 0), getPlugDataLook(*this).getObjectCornerRadius(), 1.1f);
     }
 
-    if (selectedFlag && showHandles) {
+    if (selectedFlag && showHandles && !cnv->isDrawingForExport()) {
         cnv->renderResizeHandles(nvg, nvgColour(colours.objectSelectedOutlineColour), b.toFloat().expanded(2.5f));
     }
 
@@ -1220,13 +1231,13 @@ void Object::performRender(NVGcontext* nvg)
         gui->render(nvg);
     }
 
-    if (newObjectEditor) {
+    if (newObjectEditor && !cnv->isDrawingForExport()) {
         nanovg::nvgDrawRoundedRect(nvg, 0, 0, b.getWidth(), b.getHeight(), nvgColour(colours.textObjectBackgroundColour), nvgColour(isSelected() ? colours.objectSelectedOutlineColour : colours.objectOutlineColour), getPlugDataLook(*this).getObjectCornerRadius());
         editor->getNanoLLGC()->renderComponent(*newObjectEditor);
     }
 
     // If autoconnect is about to happen, draw a fake inlet with a dotted outline
-    if (isInitialEditorShown() && cnv->lastSelectedObject && cnv->lastSelectedObject != this && cnv->lastSelectedObject->numOutputs && getValue<bool>(editor->autoconnect)) {
+    if (isInitialEditorShown() && cnv->lastSelectedObject && cnv->lastSelectedObject != this && cnv->lastSelectedObject->numOutputs && getValue<bool>(editor->autoconnect) && !cnv->isDrawingForExport()) {
         auto const* outlet = cnv->lastSelectedObject->iolets[cnv->lastSelectedObject->numInputs];
         SmallArray fakeInletBounds = getPlugDataLook(*this).getUseIoletSpacingEdge() ? SmallArray { -8.0f, -3.0f, 18.0f, 7.0f } : SmallArray { 8.5f, -3.5f, 8.0f, 8.0f };
         nanovg::nvgBeginPath(nvg);
