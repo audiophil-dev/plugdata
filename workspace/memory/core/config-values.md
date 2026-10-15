@@ -1,5 +1,0 @@
-# Config values
-
-[2026-10-01 12:35:20] - `build/` is the `ENABLE_TESTING=1` suite flavor, started with `PLUGDATA_RUN_TESTS=1`. `build-managed/` is the `ENABLE_TESTING=0` managed flavor. Both write `Plugins/Standalone/plugdata.app`, so copy the managed build to `Plugins/Standalone-managed/plugdata.app` and ad-hoc sign it on macOS before testing. The managed executable is `Plugins/Standalone-managed/plugdata.app/Contents/MacOS/plugdata`; pin it rather than using the installed app. The encoded response limit is 60 KiB; the binary relay delivered a complete 61,288-byte encoded frame in the tested managed path.
-
-[2026-10-06 15:10:00] - `Libraries/nanovg` tracks `https://github.com/audiophil-dev/nanovg.git` (fork of timothyschoen/nanovg), branch `async-offscreen-passes`, commit `02bd977` (base ca35e13 = upstream development tip). Upstream remote kept as `upstream`. Upstream PR open against timothyschoen/nanovg development; PR body archived at `.omo/evidence/nanovg-pr-draft.md` (SHA 1a4ed14a). Managed probe export evidence: `.omo/evidence/full-canvas-managed.json`.
