@@ -759,28 +759,63 @@ void NVGSurface::serviceReadbackRequest()
     if (!readbackPending.load())
         return;
 
-    auto const area = readbackDeviceArea;
+    Rectangle<int> area;
+    uint64_t requestId = 0;
+    {
+        ScopedLock const sl(readbackStateLock);
+        if (!readbackPending.load())
+            return;
+        area = readbackDeviceArea;
+        requestId = readbackRequestId;
+    }
+
+#if ENABLE_TESTING
+    if (auto const delay = delayNextLiveReadbackMs.exchange(0, std::memory_order_relaxed); delay > 0)
+        Thread::sleep(delay);
+#endif
+
     bool succeeded = false;
+    HeapBlock<uint8> pixels;
+    int width = 0;
+    int height = 0;
 
     if (baseNvg && mainFramebuffer && !area.isEmpty()
         && area.getX() >= 0 && area.getY() >= 0
         && area.getRight() <= mainFramebufferWidth
         && area.getBottom() <= mainFramebufferHeight) {
-        auto const w = area.getWidth();
-        auto const h = area.getHeight();
+        width = area.getWidth();
+        height = area.getHeight();
 
-        readbackData.malloc(static_cast<size_t>(w) * h * 4);
-        nvgReadPixels(baseNvg, reinterpret_cast<NVGframebuffer*>(mainFramebuffer),
-            area.getX(), area.getY(), w, h, mainFramebufferHeight, readbackData.getData());
-
-        readbackWidth = w;
-        readbackHeight = h;
-        succeeded = true;
+        pixels.malloc(static_cast<size_t>(width) * height * 4);
+        if (nvgReadPixels(baseNvg, reinterpret_cast<NVGframebuffer*>(mainFramebuffer),
+                area.getX(), area.getY(), width, height, mainFramebufferHeight, pixels.getData())) {
+            succeeded = true;
+        }
     }
 
-    readbackSucceeded = succeeded;
-    readbackPending.store(false);
-    readbackReady.signal();
+    bool retryPending = false;
+    {
+        ScopedLock const sl(readbackStateLock);
+        if (readbackRequestId == requestId && readbackPending.load()) {
+            if (succeeded) {
+                readbackData = std::move(pixels);
+                readbackWidth = width;
+                readbackHeight = height;
+            }
+            readbackSucceeded = succeeded;
+            readbackPending.store(false);
+            readbackReady.signal();
+        } else {
+            retryPending = readbackPending.load();
+#if ENABLE_TESTING
+            if (readbackRequestId != requestId)
+                supersededLiveReadback.store(true, std::memory_order_relaxed);
+#endif
+        }
+    }
+
+    if (retryPending)
+        requestBackendRender();
 }
 
 void NVGSurface::serviceOffscreenRequest()
@@ -815,8 +850,49 @@ void NVGSurface::serviceOffscreenRequest()
 
         if (auto* realTarget = reinterpret_cast<NVGframebuffer*>(nanovg::underlyingFramebuffer(asyncNvg, target))) {
             offscreenData.malloc(static_cast<size_t>(width) * height * 4);
-            nvgReadPixels(baseNvg, realTarget, 0, 0, width, height, height, offscreenData.getData());
-            succeeded = true;
+#if ENABLE_TESTING && NANOVG_GL_IMPLEMENTATION
+            bool const checkPackState = poisonNextOffscreenPackState.exchange(false, std::memory_order_relaxed);
+            GLint previousAlignment = 4, previousRowLength = 0, previousSkipRows = 0, previousSkipPixels = 0, previousPackBuffer = 0;
+            GLuint testPackBuffer = 0;
+            if (checkPackState) {
+                glGetIntegerv(GL_PACK_ALIGNMENT, &previousAlignment);
+                glGetIntegerv(GL_PACK_ROW_LENGTH, &previousRowLength);
+                glGetIntegerv(GL_PACK_SKIP_ROWS, &previousSkipRows);
+                glGetIntegerv(GL_PACK_SKIP_PIXELS, &previousSkipPixels);
+                glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &previousPackBuffer);
+                glGenBuffers(1, &testPackBuffer);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, testPackBuffer);
+                glBufferData(GL_PIXEL_PACK_BUFFER, 16, nullptr, GL_STREAM_READ);
+                glPixelStorei(GL_PACK_ALIGNMENT, 8);
+                glPixelStorei(GL_PACK_ROW_LENGTH, width + 5);
+                glPixelStorei(GL_PACK_SKIP_ROWS, 1);
+                glPixelStorei(GL_PACK_SKIP_PIXELS, 2);
+            }
+#endif
+            int readWidth = width;
+#if ENABLE_TESTING
+            if (failNextOffscreenReadback.exchange(false, std::memory_order_relaxed))
+                readWidth = -1;
+#endif
+            succeeded = nvgReadPixels(baseNvg, realTarget, 0, 0, readWidth, height, height, offscreenData.getData()) != 0;
+#if ENABLE_TESTING && NANOVG_GL_IMPLEMENTATION
+            if (checkPackState) {
+                GLint alignment = 0, rowLength = 0, skipRows = 0, skipPixels = 0, packBuffer = 0;
+                glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+                glGetIntegerv(GL_PACK_ROW_LENGTH, &rowLength);
+                glGetIntegerv(GL_PACK_SKIP_ROWS, &skipRows);
+                glGetIntegerv(GL_PACK_SKIP_PIXELS, &skipPixels);
+                glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
+                packStateRestored.store(alignment == 8 && rowLength == width + 5 && skipRows == 1
+                    && skipPixels == 2 && packBuffer == static_cast<GLint>(testPackBuffer), std::memory_order_relaxed);
+                glPixelStorei(GL_PACK_ALIGNMENT, previousAlignment);
+                glPixelStorei(GL_PACK_ROW_LENGTH, previousRowLength);
+                glPixelStorei(GL_PACK_SKIP_ROWS, previousSkipRows);
+                glPixelStorei(GL_PACK_SKIP_PIXELS, previousSkipPixels);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(previousPackBuffer));
+                glDeleteBuffers(1, &testPackBuffer);
+            }
+#endif
         }
 
         nanovg::deleteFramebuffer(asyncNvg, target);
@@ -824,21 +900,17 @@ void NVGSurface::serviceOffscreenRequest()
         nanovg::applyCommittedResources(asyncNvg);
     }
 
-    bool completedCurrentRequest = false;
     {
         ScopedLock const sl(offscreenLock);
         if (offscreenRequestId == requestId) {
-            completedCurrentRequest = true;
             if (offscreenTarget == target)
                 offscreenTarget = nullptr;
             offscreenSucceeded = succeeded;
             offscreenPending.store(false);
+            offscreenReady.signal();
         }
         // A newer request superseded this one: leave its state for its own pass.
     }
-
-    if (completedCurrentRequest)
-        offscreenReady.signal();
 }
 
 int NVGSurface::getMaxTextureSize() const
@@ -963,16 +1035,23 @@ Image NVGSurface::renderToImage(Rectangle<int> logicalArea)
     // One readback at a time; the eyedropper is the only caller.
     ScopedLock const sl(readbackLock);
 
-    readbackDeviceArea = deviceArea;
-    readbackSucceeded = false;
-    readbackReady.reset();
-    readbackPending.store(true);
+    uint64_t requestId = 0;
+    {
+        ScopedLock const stateLock(readbackStateLock);
+        requestId = ++readbackRequestId;
+        readbackDeviceArea = deviceArea;
+        readbackSucceeded = false;
+        readbackReady.reset();
+        readbackPending.store(true);
+    }
 
     // Kick the render thread, which owns the framebuffer, to service the request.
     requestBackendRender();
 
-    if (!readbackReady.wait(200) || !readbackSucceeded) {
-        readbackPending.store(false);
+    if (!readbackReady.wait(2000) || !readbackSucceeded) {
+        ScopedLock const stateLock(readbackStateLock);
+        if (readbackRequestId == requestId)
+            readbackPending.store(false);
         return {};
     }
 

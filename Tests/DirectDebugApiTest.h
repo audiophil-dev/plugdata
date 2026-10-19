@@ -5099,6 +5099,9 @@ private:
             constexpr int targetHeight = 131;
 
             bool tooLarge = false;
+#if NANOVG_GL_IMPLEMENTATION
+            surface->poisonNextOffscreenPackStateForTesting();
+#endif
             Image const offscreen = surface->renderOffscreenImage(targetWidth, targetHeight,
                 [](NVGcontext* nvg) {
                     nanovg::nvgBeginFrame(nvg, 257.0f, 131.0f, 1.0f);
@@ -5117,6 +5120,9 @@ private:
                 }, tooLarge);
 
             check(!tooLarge, "an under-limit offscreen target must not be rejected as too large");
+#if NANOVG_GL_IMPLEMENTATION
+            check(surface->wasPackStateRestoredForTesting(), "offscreen readback must restore nondefault GL pixel-pack state");
+#endif
             check(!offscreen.isNull(), "the offscreen target must render and read back");
             if (!offscreen.isNull()) {
                 check(offscreen.getWidth() == targetWidth && offscreen.getHeight() == targetHeight,
@@ -5149,6 +5155,18 @@ private:
                 }
             }
             check(unchanged, "the live editor surface must be unchanged after an offscreen render");
+
+#if JUCE_LINUX
+            surface->delayNextLiveReadbackForTesting(2300);
+            Image const timedOut = surface->renderToImage(probeArea);
+            check(timedOut.isNull(), "a delayed live readback must time out");
+            auto const retryArea = probeArea.withTrimmedLeft(8).withTrimmedTop(5);
+            Image const retried = surface->renderToImage(retryArea);
+            check(surface->wasLiveReadbackSupersededForTesting(), "the timed-out readback must not complete the retry");
+            check(!retried.isNull() && retried.getWidth() == retryArea.getWidth()
+                    && retried.getHeight() == retryArea.getHeight(),
+                "the retry must read its own area, not the timed-out request's pixels");
+#endif
 
             // Over-limit requests must be rejected before allocating.
             bool overLimitTooLarge = false;
@@ -5434,6 +5452,24 @@ private:
             checkConsoleErrorMessage(0, "failed to write png file");
             check(readBytes(dest) == beforeEncodeFailure, "an encode failure must preserve the previous destination byte-for-byte");
             check(stagingResidue() == 0, "an encode failure must leave no staging file");
+
+            check(writeSentinel(), "the atomic destination must be rewritable before a readback failure");
+            MemoryBlock const beforeReadbackFailure = readBytes(dest);
+            editor->nvgSurface.failNextOffscreenReadbackForTesting();
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(716, "export-atomic-generation", dest.getFullPathName()), 716, false, "ExportFailed");
+            flushDebugQueue();
+            checkConsoleReply(0, 716, false, "ExportFailed");
+            checkConsoleErrorMessage(0, "framebuffer readback failed");
+            check(readBytes(dest) == beforeReadbackFailure, "a readback failure must preserve the previous destination byte-for-byte");
+            check(stagingResidue() == 0, "a readback failure must leave no staging file");
+            consoleBegin();
+            sendRequest(makeExportCanvasRequest(717, "export-atomic-generation", dest.getFullPathName()), 717, true, {});
+            flushDebugQueue();
+            checkExportSaved(0, false);
+            if (atomicBounds.has_value())
+                checkExportFile(dest, *atomicBounds, "export after readback failure");
+            check(stagingResidue() == 0, "recovery after readback failure must leave no staging file");
 
             // (c) An unwritable destination directory must fail without touching
             // the file it already contains.

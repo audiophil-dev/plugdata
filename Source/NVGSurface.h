@@ -207,6 +207,16 @@ public:
     // texture limit or the pixel budget.
     Image renderOffscreenImage(int width, int height, std::function<void(NVGcontext*)> draw, bool& tooLarge);
 
+#if ENABLE_TESTING
+    void failNextOffscreenReadbackForTesting() { failNextOffscreenReadback.store(true, std::memory_order_relaxed); }
+    void delayNextLiveReadbackForTesting(int ms) { delayNextLiveReadbackMs.store(ms, std::memory_order_relaxed); supersededLiveReadback.store(false, std::memory_order_relaxed); }
+    bool wasLiveReadbackSupersededForTesting() const { return supersededLiveReadback.load(std::memory_order_relaxed); }
+#if NANOVG_GL_IMPLEMENTATION
+    void poisonNextOffscreenPackStateForTesting() { poisonNextOffscreenPackState.store(true, std::memory_order_relaxed); packStateRestored.store(false, std::memory_order_relaxed); }
+    bool wasPackStateRestoredForTesting() const { return packStateRestored.load(std::memory_order_relaxed); }
+#endif
+#endif
+
     // Backend maximum 2D texture dimension, or 0 when unavailable.
     int getMaxTextureSize() const;
 
@@ -279,13 +289,23 @@ private:
     // Framebuffer readback (eyedropper). The request is filled on the message
     // thread and serviced on the render thread, which owns the framebuffer.
     CriticalSection readbackLock;                 // serialises readback requests
+    CriticalSection readbackStateLock;
     WaitableEvent readbackReady;                  // signalled by the render thread
     AtomicValue<bool> readbackPending { false };
     Rectangle<int> readbackDeviceArea;            // requested region, in device pixels
+    uint64_t readbackRequestId = 0;
     HeapBlock<uint8> readbackData;                // filled with BGRA pixels
     int readbackWidth = 0;
     int readbackHeight = 0;
     bool readbackSucceeded = false;
+#if ENABLE_TESTING
+    std::atomic<int> delayNextLiveReadbackMs { 0 };
+    std::atomic<bool> supersededLiveReadback { false };
+#if NANOVG_GL_IMPLEMENTATION
+    std::atomic<bool> poisonNextOffscreenPackState { false };
+    std::atomic<bool> packStateRestored { false };
+#endif
+#endif
 
     // Offscreen export target. `renderOffscreenImage` records the target's
     // creation and the caller's draw as a standalone pass on the message thread;
@@ -300,6 +320,9 @@ private:
     uint64_t offscreenRequestId = 0;
     HeapBlock<uint8> offscreenData;
     bool offscreenSucceeded = false;
+#if ENABLE_TESTING
+    std::atomic<bool> failNextOffscreenReadback { false };
+#endif
 
     // Backend 2D texture limit captured on the render thread (where the real
     // context is current). The message thread only reads this cache:
