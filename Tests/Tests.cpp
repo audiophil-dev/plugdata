@@ -92,7 +92,10 @@ void runTests(PluginEditor* editor)
             &helpfileErrorTest };
 
 
-        runner.runTests(tests, 23);
+        if (SystemStats::getEnvironmentVariable("PLUGDATA_TEST_FILTER", {}) == "direct-debug-api")
+            runner.runTests({ &directDebugApiTest }, 23);
+        else
+            runner.runTests(tests, 23);
 
         // The suite has finished (whether tests passed or failed). Quit the app
         // so the process exits instead of idling forever - the CI harness waits
