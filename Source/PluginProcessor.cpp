@@ -197,6 +197,11 @@ PluginProcessor::PluginProcessor()
 
     sendMessagesFromQueue();
     startDSP();
+
+    if (ProjectInfo::isStandalone) {
+        backupRunLoopInterval = 24;
+        backupRunLoop.startTimer(backupRunLoopInterval);
+    }
 }
 
 PluginProcessor::~PluginProcessor()
@@ -741,11 +746,9 @@ void PluginProcessor::prepareToPlay(double const sampleRate, int const samplesPe
 
     smoothedGain.reset(AudioProcessor::getSampleRate(), 0.02);
 
-    if (!ProjectInfo::isStandalone) {
-        backupRunLoopInterval = static_cast<int>(samplesPerBlock / sampleRate * 2000.0);
-        backupRunLoopInterval = jmax(24, backupRunLoopInterval);
-        backupRunLoop.startTimer(backupRunLoopInterval * 32);
-    }
+    backupRunLoopInterval = static_cast<int>(samplesPerBlock / sampleRate * 2000.0);
+    backupRunLoopInterval = jmax(24, backupRunLoopInterval);
+    backupRunLoop.startTimer(backupRunLoopInterval * 32);
 }
 
 bool PluginProcessor::isBusesLayoutSupported(BusesLayout const& layouts) const
@@ -850,11 +853,9 @@ void PluginProcessor::processBlock(AudioBuffer<float>& buffer, MidiBuffer& midiB
 
     setThis();
 
-    if (!ProjectInfo::isStandalone) {
-        backupLoopLock.enter();
-        backupRunLoop.stopTimer();
-        backupLoopLock.exit();
-    }
+    backupLoopLock.enter();
+    backupRunLoop.stopTimer();
+    backupLoopLock.exit();
 
     sendPlayhead();
 
@@ -951,11 +952,9 @@ void PluginProcessor::processBlock(AudioBuffer<float>& buffer, MidiBuffer& midiB
     }
 
     // If we miss 4 audio blocks, start the backup scheduler
-    if (!ProjectInfo::isStandalone) {
-        backupLoopLock.enter();
-        backupRunLoop.startTimer(backupRunLoopInterval * 4);
-        backupLoopLock.exit();
-    }
+    backupLoopLock.enter();
+    backupRunLoop.startTimer(backupRunLoopInterval * 4);
+    backupLoopLock.exit();
 
     isProcessingAudio = false;
 #if ENABLE_TESTING
@@ -1657,12 +1656,17 @@ void PluginProcessor::setTheme(String themeToUse, bool const force)
 
 void PluginProcessor::runBackupLoop()
 {
-    if (ProjectInfo::isStandalone)
-        return;
-
     // Only run backup timer if GUI is visible
     if (!getActiveEditor())
         return;
+
+    if (AudioProcessor::getSampleRate() <= 0.0) {
+        setThis();
+        ScopedTryLock const scopedAudioLock(backupLoopLock);
+        if (scopedAudioLock.isLocked())
+            sys_pollgui();
+        return;
+    }
 
     int blocksToProcess = backupRunLoopInterval / std::max(1, static_cast<int>((DEFDACBLKSIZE / AudioProcessor::getSampleRate()) * 1000.0));
     if (blocksToProcess < 1) {
