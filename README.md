@@ -383,6 +383,22 @@ readback in the timeout case. The probe's binary relay accepts encoded replies
 up to 60 KiB. A timeout or broken reply in other clients likewise has unknown
 outcome; don't automatically resend an edit, and inspect the live canvas first.
 
+On Linux, build the normal flavor, copy its standalone executable to a separate
+managed path before building the test flavor, and point the probe at the relay
+patches from a local pd-mcp checkout:
+
+```sh
+cmake -B build-managed -GNinja -DENABLE_TESTING=0
+cmake --build build-managed --target plugdata_standalone
+mkdir -p Plugins/Standalone-managed
+cp Plugins/Standalone/plugdata Plugins/Standalone/plugdata-resources.bin Plugins/Standalone-managed/
+PD_MCP_PATCH_DIR=/path/to/pd-mcp/pd node Tests/canvas-edit-managed-probe.mjs --binary Plugins/Standalone-managed/plugdata --output /tmp/canvas-edit-managed.json
+```
+
+For the in-app Direct Debug API and offscreen OpenGL tests without the full
+helpfile fuzz suite, build with `ENABLE_TESTING=1` and launch with
+`PLUGDATA_RUN_TESTS=1 PLUGDATA_TEST_FILTER=direct-debug-api`.
+
 ### Licensing note for this fork
 
 This repository is a fork of plugdata with source-level modifications

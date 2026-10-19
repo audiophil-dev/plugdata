@@ -13,9 +13,10 @@ const options = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, i
 }, []));
 assert.deepEqual(Object.keys(options).sort(), ['--binary', '--output']);
 const binary = realpathSync(resolve(options['--binary']));
-assert(binary.endsWith('/Plugins/Standalone-managed/plugdata.app/Contents/MacOS/plugdata'));
+assert(binary.endsWith('/Plugins/Standalone-managed/plugdata.app/Contents/MacOS/plugdata')
+    || binary.endsWith('/Plugins/Standalone-managed/plugdata'));
 const output = resolve(options['--output']);
-const sibling = resolve(import.meta.dirname, '../../pd-mcp/pd');
+const sibling = resolve(process.env.PD_MCP_PATCH_DIR ?? resolve(import.meta.dirname, '../../pd-mcp/pd'));
 const directory = mkdtempSync(join(tmpdir(), 'canvas-edit-managed-'));
 const wait = (ms) => new Promise((done) => setTimeout(done, ms));
 const evidence = { binary, flavor: 'ENABLE_TESTING=0', events: [], checks: [], cleanup: {}, status: 'failed' };
@@ -41,9 +42,13 @@ async function freePort() {
 
 async function send(port, frame) {
     await new Promise((done, fail) => {
-        const socket = createConnection({ host: '127.0.0.1', port }, () => socket.end(frame));
+        const socket = createConnection({ host: '127.0.0.1', port }, () => socket.end(frame, () => {
+            socket.unref();
+            socket.setTimeout(10000, () => socket.destroy());
+            done();
+        }));
+        socket.setTimeout(10000, () => socket.destroy(new Error(`SendTimeout ${port}`)));
         socket.once('error', fail);
-        socket.once('close', done);
     });
 }
 
@@ -259,7 +264,8 @@ try {
         let stderr = '';
         child.stderr.on('data', (chunk) => { stderr = (stderr + chunk.toString()).slice(-6000); });
         await until(() => {
-            if (child.exitCode !== null) throw new Error(`Managed binary exited: ${child.exitCode}\n${stderr}`);
+            if (child.exitCode !== null || child.signalCode !== null)
+                throw new Error(`Managed binary exited: ${child.exitCode ?? child.signalCode}\n${stderr}`);
             try {
                 return [editPort, bridgePort].every((port) => {
                     const owners = execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' }).trim().split(/\s+/);
